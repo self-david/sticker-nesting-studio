@@ -1,7 +1,10 @@
 import {
+  MAX_PAPER_MM,
   MAX_SIZE_MM,
+  MIN_PAPER_MM,
   MIN_SIZE_MM,
   clamp,
+  type PaperId,
   type Rotation,
   type SheetCopy,
   type SheetSettings,
@@ -72,14 +75,18 @@ export function quarterTurn(value: number): Rotation {
  */
 export function hydrateProject(payload: LoadedProjectPayload): LoadedProject {
   const raw = payload.settings ?? ({} as SheetSettings);
+  const paper: PaperId =
+    raw.paper === "letter" || raw.paper === "custom" ? raw.paper : "a4";
   const settings: SheetSettings = {
-    paper: raw.paper === "letter" ? "letter" : "a4",
+    paper,
     orientation: raw.orientation === "landscape" ? "landscape" : "portrait",
     marginMm: clamp(Number(raw.marginMm), 0, 100),
     gapMm: clamp(Number(raw.gapMm), 0, 30),
     cutLines: raw.cutLines !== false,
     outlineWidthMm: clamp(Number(raw.outlineWidthMm), 0.05, 5),
     outlinePadMm: clamp(Number(raw.outlinePadMm), 0, 30),
+    customWidthMm: clamp(Number(raw.customWidthMm) || 210, MIN_PAPER_MM, MAX_PAPER_MM),
+    customHeightMm: clamp(Number(raw.customHeightMm) || 297, MIN_PAPER_MM, MAX_PAPER_MM),
   };
 
   const seen = new Set<string>();

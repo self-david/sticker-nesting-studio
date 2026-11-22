@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
-import type { Sticker } from "../types";
+import type { FacetCount, Sticker } from "../types";
 import { useI18n } from "../lib/i18n";
+import { TIPOS } from "../lib/tipos";
 import { assetUrl } from "../lib/api";
 import { fmtBytes, fmtDate, fmtMm, round1 } from "../lib/format";
 import { Thumb } from "./Thumb";
@@ -11,6 +12,9 @@ interface Props {
   onClose: () => void;
   onPatch: (id: string, patch: { name?: string; widthMm?: number; heightMm?: number }) => Promise<void>;
   onTags: (id: string, tags: string[]) => Promise<void>;
+  /** Series already in use, for the autocomplete. */
+  series: FacetCount[];
+  onClassification: (id: string, serie: string, tipo: string) => Promise<void>;
   onDelete: (id: string) => void;
   onAi: (id: string) => void;
   aiBusy: boolean;
@@ -22,6 +26,8 @@ export function DetailPanel({
   onClose,
   onPatch,
   onTags,
+  series,
+  onClassification,
   onDelete,
   onAi,
   aiBusy,
@@ -32,6 +38,7 @@ export function DetailPanel({
   const [height, setHeight] = useState(String(round1(sticker.heightMm)));
   const [lock, setLock] = useState(true);
   const [tagInput, setTagInput] = useState("");
+  const [serieInput, setSerieInput] = useState(sticker.serie);
   const [busy, setBusy] = useState(false);
 
   const ratio = sticker.widthMm / sticker.heightMm || 1;
@@ -41,7 +48,8 @@ export function DetailPanel({
     setWidth(String(round1(sticker.widthMm)));
     setHeight(String(round1(sticker.heightMm)));
     setTagInput("");
-  }, [sticker.id, sticker.name, sticker.widthMm, sticker.heightMm]);
+    setSerieInput(sticker.serie);
+  }, [sticker.id, sticker.name, sticker.widthMm, sticker.heightMm, sticker.serie]);
 
   const commitName = async () => {
     const trimmed = name.trim();
@@ -52,6 +60,20 @@ export function DetailPanel({
     setBusy(true);
     try {
       await onPatch(sticker.id, { name: trimmed });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const commitSerie = async () => {
+    const trimmed = serieInput.trim();
+    if (trimmed === sticker.serie) {
+      setSerieInput(sticker.serie);
+      return;
+    }
+    setBusy(true);
+    try {
+      await onClassification(sticker.id, trimmed, sticker.tipo);
     } finally {
       setBusy(false);
     }
@@ -132,6 +154,47 @@ export function DetailPanel({
           }}
         />
       </label>
+
+      <div className="field-grid">
+        <label className="field">
+          <span className="field-label">{t("detail.serie")}</span>
+          <input
+            className="text-input"
+            list="detail-series"
+            value={serieInput}
+            placeholder={t("detail.seriePlaceholder")}
+            disabled={busy}
+            onChange={(e) => setSerieInput(e.target.value)}
+            onBlur={commitSerie}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+            }}
+          />
+        </label>
+        <label className="field">
+          <span className="field-label">{t("detail.tipo")}</span>
+          <select
+            className="text-input detail-tipo"
+            value={sticker.tipo}
+            disabled={busy}
+            onChange={(e) => void onClassification(sticker.id, sticker.serie, e.target.value)}
+          >
+            <option value="">{t("facet.noTipo")}</option>
+            {TIPOS.map((tipo) => (
+              <option key={tipo} value={tipo}>
+                {tipo}
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
+      <datalist id="detail-series">
+        {series
+          .filter((facet) => facet.value !== "")
+          .map((facet) => (
+            <option key={facet.value} value={facet.value} />
+          ))}
+      </datalist>
 
       <div className="field">
         <div className="field-row">

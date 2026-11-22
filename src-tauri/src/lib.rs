@@ -1,4 +1,5 @@
 mod ai;
+mod archive;
 mod contour;
 mod db;
 mod importer;
@@ -154,6 +155,150 @@ fn list_tags(state: State<'_, AppState>) -> Result<Vec<db::TagCount>, String> {
 }
 
 #[tauri::command]
+fn list_series(state: State<'_, AppState>) -> Result<Vec<db::FacetCount>, String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    db::series_counts(&conn)
+}
+
+#[tauri::command]
+fn list_tipos(state: State<'_, AppState>) -> Result<Vec<db::FacetCount>, String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    db::tipo_counts(&conn)
+}
+
+/// Manual edit of the pair: the panel's two fields, not the AI classifier.
+#[tauri::command]
+fn set_sticker_classification(
+    state: State<'_, AppState>,
+    id: String,
+    serie: String,
+    tipo: String,
+) -> Result<(), String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    db::set_classification(&conn, &id, &serie, &tipo)
+}
+
+/// Bulk edit from the selection bar: each field is optional, so setting the
+/// type of 30 stickers leaves their series alone.
+#[tauri::command]
+fn set_stickers_classification(
+    state: State<'_, AppState>,
+    ids: Vec<String>,
+    serie: Option<String>,
+    tipo: Option<String>,
+) -> Result<usize, String> {
+    let mut conn = state.conn.lock().map_err(|e| e.to_string())?;
+    db::set_classifications(&mut conn, &ids, serie.as_deref(), tipo.as_deref())
+}
+
+/// Folds several series into one name. A rename is the same operation with a
+/// single source, so there is only one command to keep right.
+#[tauri::command]
+fn merge_series(
+    state: State<'_, AppState>,
+    from: Vec<String>,
+    into: String,
+) -> Result<usize, String> {
+    let mut conn = state.conn.lock().map_err(|e| e.to_string())?;
+    db::merge_series(&mut conn, &from, &into)
+}
+
+/// Writes the whole library into one `.zip`: the artwork plus a manifest with
+/// every column and the tags, so another machine can import it as it was.
+#[tauri::command]
+async fn export_library(
+    state: State<'_, AppState>,
+    destination: String,
+) -> Result<String, String> {
+    let root = state.root.clone();
+    let stickers = {
+        let conn = state.conn.lock().map_err(|e| e.to_string())?;
+        db::list(&conn, &root, "", &[], "recent")?
+    };
+    let target = PathBuf::from(destination);
+    tauri::async_runtime::spawn_blocking(move || {
+        archive::export(&root, &stickers, &target).map(|path| path.to_string_lossy().to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Reads an archive's manifest and says which stickers are already here, so the
+/// window can ask what to do with each one before anything is written.
+#[tauri::command]
+async fn inspect_library_archive(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<archive::Peek, String> {
+    let existing = {
+        let conn = state.conn.lock().map_err(|e| e.to_string())?;
+        db::id_names(&conn)?
+    };
+    let file = PathBuf::from(path);
+    tauri::async_runtime::spawn_blocking(move || archive::peek(&file, &existing))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Imports an archive applying the chosen conflict decisions. The artwork is
+/// copied and thumbnailed off the UI thread; only the rows are written here.
+#[tauri::command]
+async fn import_library_archive(
+    state: State<'_, AppState>,
+    path: String,
+    decisions: Vec<archive::Decision>,
+) -> Result<archive::ImportReport, String> {
+    let root = state.root.clone();
+    let existing = {
+        let conn = state.conn.lock().map_err(|e| e.to_string())?;
+        db::id_names(&conn)?
+    };
+    let file = PathBuf::from(&path);
+    let planned = tauri::async_runtime::spawn_blocking({
+        let file = file.clone();
+        move || archive::plan(&file, &decisions, &existing)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    let mut report = archive::ImportReport {
+        imported: 0,
+        replaced: 0,
+        duplicated: 0,
+        skipped: planned.skipped,
+        failures: Vec::new(),
+    };
+    if planned.plans.is_empty() {
+        return Ok(report);
+    }
+
+    let handoff = root.clone();
+    let outcomes = tauri::async_runtime::spawn_blocking(move || {
+        archive::extract(&handoff, &file, planned.plans)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    let mut conn = state.conn.lock().map_err(|e| e.to_string())?;
+    for outcome in outcomes {
+        let name = outcome.plan.sticker.name.clone();
+        if let Some(message) = outcome.error.clone() {
+            report.failures.push(archive::Failure { name, message });
+            continue;
+        }
+        let duplicated = outcome.plan.sticker.id != outcome.plan.id;
+        let replaced = outcome.plan.replace;
+        match archive::store(&mut conn, &root, &outcome) {
+            Ok(()) if replaced => report.replaced += 1,
+            Ok(()) if duplicated => report.duplicated += 1,
+            Ok(()) => report.imported += 1,
+            Err(message) => report.failures.push(archive::Failure { name, message }),
+        }
+    }
+    Ok(report)
+}
+
+#[tauri::command]
 fn update_sticker(
     state: State<'_, AppState>,
     id: String,
@@ -255,12 +400,35 @@ async fn ai_describe(state: State<'_, AppState>, ids: Vec<String>) -> Result<ai:
                 continue;
             }
         };
-        let outcome = ask_with_keys(&state, &client, &keys, &model, &image).await;
+        let chat = ai::Chat {
+            model: &model,
+            system: ai::SYSTEM,
+            content: ai::vision_content(&image),
+            max_tokens: 300,
+        };
+        let outcome = ask_with_keys(&state, &client, &keys, &chat).await;
         match outcome {
-            Ok(answer) => {
+            Ok(raw) => {
+                let answer = match ai::answer_from(&raw) {
+                    Ok(answer) => answer,
+                    Err(message) => {
+                        failures.push(ai::Failure {
+                            id: source.id,
+                            message,
+                        });
+                        continue;
+                    }
+                };
                 let saved = {
                     let conn = state.conn.lock().map_err(|e| e.to_string())?;
-                    db::apply_ai(&conn, &source.id, &answer.name, &answer.tags)
+                    db::apply_ai(
+                        &conn,
+                        &source.id,
+                        &answer.name,
+                        &answer.serie,
+                        &answer.tipo,
+                        &answer.tags,
+                    )
                 };
                 match saved {
                     Ok(_) => updated.push(source.id),
@@ -280,6 +448,94 @@ async fn ai_describe(state: State<'_, AppState>, ids: Vec<String>) -> Result<ai:
     Ok(ai::Report { updated, failures })
 }
 
+/// Fills the series and the type of every sticker that has not been classified
+/// yet, reading only its name and tags: the artwork is never sent again, and
+/// neither the name nor the tags are written.
+#[tauri::command]
+async fn ai_classify(state: State<'_, AppState>) -> Result<ai::Report, String> {
+    let Some((keys, model)) = ai::load(&state.root) else {
+        return Err("Añade al menos una clave de Groq en «Renombrar con IA».".to_string());
+    };
+
+    let (queue, mut series) = {
+        let conn = state.conn.lock().map_err(|e| e.to_string())?;
+        (db::classify_queue(&conn)?, db::known_series(&conn)?)
+    };
+    let mut updated = Vec::new();
+    let mut failures = Vec::new();
+    if queue.is_empty() {
+        return Ok(ai::Report { updated, failures });
+    }
+
+    let client = ai::client()?;
+    for chunk in queue.chunks(ai::CLASSIFY_BATCH) {
+        let inputs: Vec<ai::ClassifyInput> = chunk
+            .iter()
+            .map(|item| ai::ClassifyInput {
+                id: item.id.clone(),
+                name: item.name.clone(),
+                tags: item.tags.clone(),
+            })
+            .collect();
+        let wanted: Vec<String> = inputs.iter().map(|item| item.id.clone()).collect();
+        let chat = ai::Chat {
+            model: &model,
+            system: ai::CLASSIFY_SYSTEM,
+            content: ai::classify_content(&series, &inputs),
+            max_tokens: ai::CLASSIFY_MAX_TOKENS,
+        };
+
+        let raw = match ask_with_keys(&state, &client, &keys, &chat).await {
+            Ok(raw) => raw,
+            Err(message) => {
+                failures.push(ai::Failure {
+                    id: String::new(),
+                    message,
+                });
+                continue;
+            }
+        };
+        let items = match ai::parse_classifications(&raw, &wanted) {
+            Ok(items) => items,
+            Err(message) => {
+                failures.push(ai::Failure {
+                    id: String::new(),
+                    message,
+                });
+                continue;
+            }
+        };
+        if items.is_empty() {
+            failures.push(ai::Failure {
+                id: String::new(),
+                message: "La IA no clasificó ninguno de estos stickers".into(),
+            });
+            continue;
+        }
+
+        let conn = state.conn.lock().map_err(|e| e.to_string())?;
+        for item in items {
+            match db::set_classification(&conn, &item.id, &item.serie, &item.tipo) {
+                Ok(_) => {
+                    // The next batches see the series this one just used.
+                    if !item.serie.is_empty()
+                        && !series.iter().any(|known| known.eq_ignore_ascii_case(&item.serie))
+                    {
+                        series.push(item.serie.clone());
+                    }
+                    updated.push(item.id);
+                }
+                Err(message) => failures.push(ai::Failure {
+                    id: item.id,
+                    message,
+                }),
+            }
+        }
+    }
+
+    Ok(ai::Report { updated, failures })
+}
+
 /// One request per key, starting where the previous sticker left off, and
 /// skipping the keys Groq has just throttled so no request is wasted on a
 /// key that is known to be busy.
@@ -287,9 +543,8 @@ async fn ask_with_keys(
     state: &State<'_, AppState>,
     client: &reqwest::Client,
     keys: &[ai::StoredKey],
-    model: &str,
-    image: &ai::Prepared,
-) -> Result<ai::Answer, String> {
+    chat: &ai::Chat<'_>,
+) -> Result<String, String> {
     let start = {
         let mut cursor = state.ai_cursor.lock().map_err(|e| e.to_string())?;
         let start = *cursor % keys.len();
@@ -332,10 +587,10 @@ async fn ask_with_keys(
 
     for index in ready {
         let key = &keys[index];
-        match ai::describe(client, key, model, image).await {
-            Ok(answer) => {
+        match ai::complete(client, key, chat).await {
+            Ok(raw) => {
                 clear_cooldown(state, &key.id);
-                return Ok(answer);
+                return Ok(raw);
             }
             Err(ai::CallError::Throttled(wait)) => {
                 set_cooldown(state, &key.id, wait);
@@ -352,10 +607,10 @@ async fn ask_with_keys(
     if problems.is_empty() {
         if let Some((wait, index)) = waits.iter().copied().min_by(|a, b| a.0.total_cmp(&b.0)) {
             tokio::time::sleep(Duration::from_secs_f64(wait.min(60.0) + 0.3)).await;
-            match ai::describe(client, &keys[index], model, image).await {
-                Ok(answer) => {
+            match ai::complete(client, &keys[index], chat).await {
+                Ok(raw) => {
                     clear_cooldown(state, &keys[index].id);
-                    return Ok(answer);
+                    return Ok(raw);
                 }
                 Err(ai::CallError::Key(message)) => {
                     problems.push(format!("{}: {message}", keys[index].name))
@@ -552,6 +807,37 @@ fn open_sheet_project(
     Ok(opened)
 }
 
+/// Sheets live in the library database, so they reopen without a file to keep
+/// track of. The manifest is the same JSON a `.sns` carries.
+#[tauri::command]
+fn list_saved_sheets(state: State<'_, AppState>) -> Result<Vec<db::SavedSheet>, String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    db::list_sheets(&conn)
+}
+
+#[tauri::command]
+fn save_saved_sheet(
+    state: State<'_, AppState>,
+    id: Option<String>,
+    name: String,
+    payload: String,
+) -> Result<db::SavedSheet, String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    db::save_sheet(&conn, id.as_deref(), &name, &payload)
+}
+
+#[tauri::command]
+fn open_saved_sheet(state: State<'_, AppState>, id: String) -> Result<String, String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    db::open_sheet(&conn, &id)
+}
+
+#[tauri::command]
+fn delete_saved_sheet(state: State<'_, AppState>, id: String) -> Result<usize, String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    db::delete_sheet(&conn, &id)
+}
+
 #[tauri::command]
 fn reveal_library(state: State<'_, AppState>) -> Result<(), String> {
     #[cfg(target_os = "windows")]
@@ -590,12 +876,21 @@ pub fn run() {
             import_paths,
             list_stickers,
             list_tags,
+            list_series,
+            list_tipos,
+            set_sticker_classification,
+            set_stickers_classification,
+            merge_series,
+            export_library,
+            inspect_library_archive,
+            import_library_archive,
             ai_status,
             ai_add_key,
             ai_update_key,
             ai_remove_key,
             ai_reorder_keys,
             ai_describe,
+            ai_classify,
             ai_test_key,
             update_sticker,
             set_sticker_tags,
@@ -605,6 +900,10 @@ pub fn run() {
             export_sheet_pdf,
             save_sheet_project,
             open_sheet_project,
+            list_saved_sheets,
+            save_saved_sheet,
+            open_saved_sheet,
+            delete_saved_sheet,
             reveal_library
         ])
         .run(tauri::generate_context!())

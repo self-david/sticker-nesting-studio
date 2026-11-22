@@ -17,10 +17,32 @@ import {
   resizeCopy,
   rotateCopy,
   layoutSheet,
+  pageDimensions,
   type Rotation,
   type SheetCopy,
 } from "./sheet";
 import type { Sticker } from "../types";
+
+describe("custom paper", () => {
+  const custom = {
+    ...DEFAULT_SETTINGS,
+    paper: "custom" as const,
+    customWidthMm: 330,
+    customHeightMm: 120,
+  };
+
+  test("measures the page in millimetres and turns with the orientation", () => {
+    expect(pageDimensions(custom)).toEqual({ w: 330, h: 120 });
+    expect(pageDimensions({ ...custom, orientation: "landscape" })).toEqual({ w: 120, h: 330 });
+  });
+
+  test("lays out copies inside the custom page", () => {
+    const layout = layoutSheet([copy("a", 40, 20), copy("b", 40, 20)], custom);
+    expect(layout.pageW).toBe(330);
+    expect(layout.pageH).toBe(120);
+    expect(layout.pages[0]).toHaveLength(2);
+  });
+});
 
 const copy = (
   id: string,
@@ -58,7 +80,10 @@ const sticker = (widthMm = 40, heightMm = 20): Sticker => ({
   filePath: "C:/lib/corona.png",
   thumbPath: "C:/lib/thumbs/corona.png",
   tags: ["realeza"],
+  serie: "",
+  tipo: "",
   aiAt: 0,
+  classifiedAt: 0,
 });
 
 describe("copiesFromSticker", () => {

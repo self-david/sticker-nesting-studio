@@ -4,6 +4,7 @@ import type {
   AiKeyCheck,
   AiReport,
   AiStatus,
+  FacetCount,
   ImportReport,
   LibraryInfo,
   SortKey,
@@ -31,6 +32,102 @@ export function listStickers(query: string, tags: string[], sort: SortKey): Prom
 
 export function listTags(): Promise<TagCount[]> {
   return invoke<TagCount[]>("list_tags");
+}
+
+export function listSeries(): Promise<FacetCount[]> {
+  return invoke<FacetCount[]>("list_series");
+}
+
+export function listTipos(): Promise<FacetCount[]> {
+  return invoke<FacetCount[]>("list_tipos");
+}
+
+/** Manual edit from the detail panel: "" clears the field. */
+export function setStickerClassification(
+  id: string,
+  serie: string,
+  tipo: string,
+): Promise<void> {
+  return invoke("set_sticker_classification", { id, serie, tipo });
+}
+
+/** Bulk edit from the selection bar: only the fields given are written. */
+export function setStickersClassification(
+  ids: string[],
+  patch: { serie?: string; tipo?: string },
+): Promise<number> {
+  return invoke<number>("set_stickers_classification", {
+    ids,
+    serie: patch.serie ?? null,
+    tipo: patch.tipo ?? null,
+  });
+}
+
+/** Every sticker of `from` ends up under `into`; returns how many moved. */
+export function mergeSeries(from: string[], into: string): Promise<number> {
+  return invoke<number>("merge_series", { from, into });
+}
+
+/** One sticker of the archive that already exists here. */
+export interface ArchiveConflict {
+  id: string;
+  name: string;
+  existingName: string;
+}
+
+export interface ArchivePeek {
+  total: number;
+  conflicts: ArchiveConflict[];
+}
+
+export interface ArchiveReport {
+  imported: number;
+  replaced: number;
+  duplicated: number;
+  skipped: number;
+  failures: { name: string; message: string }[];
+}
+
+/** What to do with a colliding id: «keep» this one, «replace» it, or keep both. */
+export type ArchiveAction = "keep" | "replace" | "both";
+
+/** Writes every sticker and its artwork into one `.zip`. */
+export function exportLibraryArchive(destination: string): Promise<string> {
+  return invoke<string>("export_library", { destination });
+}
+
+/** Lists the archive's stickers that this library already has. Writes nothing. */
+export function inspectLibraryArchive(path: string): Promise<ArchivePeek> {
+  return invoke<ArchivePeek>("inspect_library_archive", { path });
+}
+
+export function importLibraryArchive(
+  path: string,
+  decisions: { id: string; action: ArchiveAction }[],
+): Promise<ArchiveReport> {
+  return invoke<ArchiveReport>("import_library_archive", { path, decisions });
+}
+
+export async function pickLibraryExport(
+  title: string,
+  defaultName: string,
+): Promise<string | null> {
+  const picked = await save({
+    title,
+    defaultPath: defaultName,
+    filters: [{ name: "Biblioteca (.zip)", extensions: ["zip"] }],
+  });
+  if (typeof picked !== "string" || !picked) return null;
+  return /\.zip$/i.test(picked) ? picked : `${picked}.zip`;
+}
+
+export async function pickLibraryArchive(title: string): Promise<string | null> {
+  const picked = await open({
+    multiple: false,
+    title,
+    filters: [{ name: "Biblioteca (.zip)", extensions: ["zip"] }],
+  });
+  return typeof picked === "string" && picked ? picked : null;
 }
 
 export function updateSticker(
@@ -81,6 +178,11 @@ export function aiReorderKeys(ids: string[]): Promise<AiStatus> {
 /** A single cheap request, so one key can be checked on its own. */
 export function aiTestKey(id: string): Promise<AiKeyCheck> {
   return invoke<AiKeyCheck>("ai_test_key", { id });
+}
+
+/** Fills serie and tipo from names and tags only: no image, no rewrite of names. */
+export function aiClassify(): Promise<AiReport> {
+  return invoke<AiReport>("ai_classify");
 }
 
 export function aiDescribe(ids: string[]): Promise<AiReport> {
@@ -189,6 +291,40 @@ export function saveSheetProject(
 export async function openSheetProject(path: string): Promise<LoadedProject> {
   const payload = await invoke<LoadedProjectPayload>("open_sheet_project", { path });
   return hydrateProject(payload);
+}
+
+/** A sheet kept in the library database, so no file has to be managed. */
+export interface SavedSheet {
+  id: string;
+  name: string;
+  updatedAt: number;
+  copies: number;
+}
+
+export function listSavedSheets(): Promise<SavedSheet[]> {
+  return invoke<SavedSheet[]>("list_saved_sheets");
+}
+
+export function saveSavedSheet(
+  id: string | null,
+  name: string,
+  settings: SheetSettings,
+  copies: SheetCopy[],
+): Promise<SavedSheet> {
+  return invoke<SavedSheet>("save_saved_sheet", {
+    id,
+    name,
+    payload: JSON.stringify({ version: 1, settings, copies: projectCopies(copies) }),
+  });
+}
+
+export async function openSavedSheet(id: string): Promise<LoadedProject> {
+  const payload = await invoke<string>("open_saved_sheet", { id });
+  return hydrateProject(JSON.parse(payload) as LoadedProjectPayload);
+}
+
+export function deleteSavedSheet(id: string): Promise<number> {
+  return invoke<number>("delete_saved_sheet", { id });
 }
 
 /** Silhouette outlines in image-normalized coordinates (0..1, y down). */

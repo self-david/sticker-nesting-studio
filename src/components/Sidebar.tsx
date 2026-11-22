@@ -1,4 +1,4 @@
-import type { LibraryInfo, TagCount } from "../types";
+import type { FacetCount, LibraryInfo, TagCount } from "../types";
 import { useI18n } from "../lib/i18n";
 import { fmtBytes } from "../lib/format";
 
@@ -9,11 +9,52 @@ interface Props {
   activeTags: string[];
   onToggleTag: (tag: string) => void;
   onClearTags: () => void;
+  series: FacetCount[];
+  tipos: FacetCount[];
+  activeSerie: string | null;
+  activeTipo: string | null;
+  onSelectSerie: (serie: string | null) => void;
+  onSelectTipo: (tipo: string | null) => void;
+  onReviewSeries: () => void;
   info: LibraryInfo | null;
   sheetCount: number;
   onOpenFolder: () => void;
+  onExportLibrary: () => void;
+  onImportLibrary: () => void;
+  /** A whole-library export or import is running. */
+  archiveBusy: boolean;
   aiPending: number;
   onOpenAi: () => void;
+}
+
+interface FacetListProps {
+  items: FacetCount[];
+  active: string | null;
+  onSelect: (value: string | null) => void;
+  /** Label for the empty value: «Sin serie», «Sin tipo». */
+  noValue: string;
+  empty: string;
+  clear: string;
+}
+
+/** A single-choice facet: clicking the active value again clears it. */
+function FacetList({ items, active, onSelect, noValue, empty, clear }: FacetListProps) {
+  return (
+    <div className="tag-list">
+      {items.length === 0 && <p className="muted small">{empty}</p>}
+      {items.map((item) => (
+        <button
+          key={item.value || "none"}
+          className={`tag-chip is-facet${active === item.value ? " is-active" : ""}`}
+          onClick={() => onSelect(active === item.value ? null : item.value)}
+          title={active === item.value ? clear : undefined}
+        >
+          <span className="tag-name">{item.value || noValue}</span>
+          <span className="tag-count">{item.count}</span>
+        </button>
+      ))}
+    </div>
+  );
 }
 
 export function Sidebar({
@@ -23,9 +64,19 @@ export function Sidebar({
   activeTags,
   onToggleTag,
   onClearTags,
+  series,
+  tipos,
+  activeSerie,
+  activeTipo,
+  onSelectSerie,
+  onSelectTipo,
+  onReviewSeries,
   info,
   sheetCount,
   onOpenFolder,
+  onExportLibrary,
+  onImportLibrary,
+  archiveBusy,
   aiPending,
   onOpenAi,
 }: Props) {
@@ -70,28 +121,73 @@ export function Sidebar({
         </button>
       </nav>
 
-      <div className="sidebar-section">
-        <div className="sidebar-heading">
-          <span>{t("tags.title")}</span>
-          {activeTags.length > 0 && (
-            <button className="link-btn" onClick={onClearTags}>
-              {t("tags.clear")}
-            </button>
-          )}
-        </div>
-        <div className="tag-list">
-          {tags.length === 0 && <p className="muted small">{t("tags.none")}</p>}
-          {tags.map((tag) => (
-            <button
-              key={tag.tag}
-              className={`tag-chip${activeTags.includes(tag.tag) ? " is-active" : ""}`}
-              onClick={() => onToggleTag(tag.tag)}
-            >
-              <span className="tag-name">{tag.tag}</span>
-              <span className="tag-count">{tag.count}</span>
-            </button>
-          ))}
-        </div>
+      <div className="sidebar-facets">
+        <section className="sidebar-section">
+          <div className="sidebar-heading">
+            <span>{t("facet.series")}</span>
+            <span className="heading-links">
+              {activeSerie !== null && (
+                <button className="link-btn" onClick={() => onSelectSerie(null)}>
+                  {t("facet.clear")}
+                </button>
+              )}
+              <button className="link-btn" onClick={onReviewSeries}>
+                {t("series.open")}
+              </button>
+            </span>
+          </div>
+          <FacetList
+            items={series}
+            active={activeSerie}
+            onSelect={onSelectSerie}
+            noValue={t("facet.noSerie")}
+            empty={t("facet.none")}
+            clear={t("facet.clear")}
+          />
+        </section>
+
+        <section className="sidebar-section">
+          <div className="sidebar-heading">
+            <span>{t("facet.tipos")}</span>
+            {activeTipo !== null && (
+              <button className="link-btn" onClick={() => onSelectTipo(null)}>
+                {t("facet.clear")}
+              </button>
+            )}
+          </div>
+          <FacetList
+            items={tipos}
+            active={activeTipo}
+            onSelect={onSelectTipo}
+            noValue={t("facet.noTipo")}
+            empty={t("facet.none")}
+            clear={t("facet.clear")}
+          />
+        </section>
+
+        <section className="sidebar-section">
+          <div className="sidebar-heading">
+            <span>{t("tags.title")}</span>
+            {activeTags.length > 0 && (
+              <button className="link-btn" onClick={onClearTags}>
+                {t("tags.clear")}
+              </button>
+            )}
+          </div>
+          <div className="tag-list">
+            {tags.length === 0 && <p className="muted small">{t("tags.none")}</p>}
+            {tags.map((tag) => (
+              <button
+                key={tag.tag}
+                className={`tag-chip${activeTags.includes(tag.tag) ? " is-active" : ""}`}
+                onClick={() => onToggleTag(tag.tag)}
+              >
+                <span className="tag-name">{tag.tag}</span>
+                <span className="tag-count">{tag.count}</span>
+              </button>
+            ))}
+          </div>
+        </section>
       </div>
 
       <div className="sidebar-footer">
@@ -110,6 +206,16 @@ export function Sidebar({
             </div>
             <button className="ghost-btn" onClick={onOpenFolder}>
               {t("library.openFolder")}
+            </button>
+            <button
+              className="ghost-btn"
+              onClick={onExportLibrary}
+              disabled={archiveBusy || info.count === 0}
+            >
+              {archiveBusy ? t("library.archiving") : t("library.export")}
+            </button>
+            <button className="ghost-btn" onClick={onImportLibrary} disabled={archiveBusy}>
+              {t("library.import")}
             </button>
           </>
         )}

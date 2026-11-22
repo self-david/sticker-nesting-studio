@@ -32,6 +32,19 @@ pub struct ProjectSettings {
     pub cut_lines: bool,
     pub outline_width_mm: f64,
     pub outline_pad_mm: f64,
+    /// Page size used when `paper` is "custom"; older files leave it out.
+    #[serde(default = "default_page_w")]
+    pub custom_width_mm: f64,
+    #[serde(default = "default_page_h")]
+    pub custom_height_mm: f64,
+}
+
+fn default_page_w() -> f64 {
+    210.0
+}
+
+fn default_page_h() -> f64 {
+    297.0
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -314,9 +327,11 @@ fn write_sheet(target: &Path, entries: &[(String, Vec<u8>)]) -> Result<PathBuf, 
 }
 
 fn sanitize_settings(mut settings: ProjectSettings) -> ProjectSettings {
-    if settings.paper != "letter" {
+    if settings.paper != "letter" && settings.paper != "custom" {
         settings.paper = "a4".to_string();
     }
+    settings.custom_width_mm = settings.custom_width_mm.clamp(20.0, 2000.0);
+    settings.custom_height_mm = settings.custom_height_mm.clamp(20.0, 2000.0);
     if settings.orientation != "landscape" {
         settings.orientation = "portrait".to_string();
     }
@@ -706,6 +721,8 @@ mod tests {
             cut_lines: true,
             outline_width_mm: 0.3,
             outline_pad_mm: 1.5,
+            custom_width_mm: 210.0,
+            custom_height_mm: 297.0,
         }
     }
 

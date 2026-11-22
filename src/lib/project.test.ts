@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { DEFAULT_SETTINGS, type SheetCopy } from "./sheet";
+import { DEFAULT_SETTINGS, MIN_PAPER_MM, type SheetCopy } from "./sheet";
 import { hydrateProject, projectCopies, quarterTurn } from "./project";
 
 const copy = (id: string): SheetCopy => ({
@@ -56,6 +56,22 @@ describe("hydrateProject", () => {
     expect(loaded.copies).toHaveLength(1);
     expect(loaded.copies[0].filePath).toContain("archivos/a.png");
     expect(loaded.copies[0].rotation).toBe(270);
+  });
+
+  test("keeps a custom page size and clamps what is out of range", () => {
+    const loaded = hydrateProject({
+      ...payload,
+      settings: {
+        ...payload.settings,
+        paper: "custom" as never,
+        customWidthMm: 330 as never,
+        customHeightMm: 5 as never,
+      },
+    });
+    expect(loaded.settings.paper).toBe("custom");
+    expect(loaded.settings.customWidthMm).toBe(330);
+    // Anything smaller than a printable page falls back to the lower bound.
+    expect(loaded.settings.customHeightMm).toBe(MIN_PAPER_MM);
   });
 
   test("falls back to A4 for an unknown paper", () => {

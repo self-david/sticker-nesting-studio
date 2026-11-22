@@ -174,13 +174,22 @@ button {
   padding: 1px 7px;
 }
 
+/* Series, types and tags share one scroller: three lists, one column. */
+.sidebar-facets {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
 .sidebar-section {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  min-height: 0;
-  flex: 1;
-  overflow: hidden;
+  gap: 5px;
+  flex: none;
 }
 
 .sidebar-heading {
@@ -208,6 +217,11 @@ button {
   display: flex;
   flex-direction: column;
   gap: 2px;
+}
+
+/* Series and types are capped so the tags below stay reachable. */
+.sidebar-section:not(:last-child) .tag-list {
+  max-height: 168px;
   overflow-y: auto;
   padding-right: 2px;
 }
@@ -237,6 +251,12 @@ button {
   content: "#";
   opacity: 0.5;
   margin-right: 1px;
+}
+
+/* Series and types are values, not tags: no «#» in front of them. */
+.tag-chip.is-facet .tag-name::before {
+  content: "";
+  margin: 0;
 }
 
 .tag-count {
@@ -337,7 +357,8 @@ button {
 .toolbar {
   display: flex;
   align-items: center;
-  gap: 14px;
+  flex-wrap: wrap;
+  gap: 10px 14px;
   padding: 14px 18px;
   border-bottom: 1px solid var(--line-soft);
   background: linear-gradient(180deg, rgba(255, 255, 255, 0.02), transparent);
@@ -366,7 +387,6 @@ button {
   flex: 1;
   background: none;
   border: none;
-  outline: none;
   color: var(--text);
   min-width: 0;
 }
@@ -379,7 +399,9 @@ button {
 .toolbar-right {
   display: flex;
   align-items: center;
-  gap: 12px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px 12px;
   margin-left: auto;
 }
 
@@ -402,7 +424,6 @@ button {
   color: var(--text);
   border-radius: 8px;
   padding: 6px 8px;
-  outline: none;
 }
 
 .primary-btn {
@@ -428,13 +449,56 @@ button {
 .selection-bar {
   display: flex;
   align-items: center;
-  gap: 14px;
+  flex-wrap: wrap;
+  gap: 10px 14px;
   padding: 8px 18px;
   background: var(--accent-soft);
   border-bottom: 1px solid var(--line-soft);
   font-size: 12.5px;
   color: #d6c8ff;
   flex-shrink: 0;
+}
+
+/* Serie and type for the whole selection, in the bar itself. */
+.selection-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-left: auto;
+}
+
+.bulk {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+
+/* The serie box is the one that gives way when the window narrows. */
+.bulk .text-input {
+  flex: 1 1 110px;
+  width: auto;
+  min-width: 0;
+  height: 28px;
+  font-size: 12px;
+  padding: 0 8px;
+}
+
+.bulk-tipo {
+  height: 28px;
+  padding: 0 6px;
+  border-radius: 8px;
+  font-size: 12px;
+  background: var(--panel-2);
+  border: 1px solid var(--line-soft);
+  color: var(--text);
+}
+
+.bulk-apply {
+  height: 28px;
+  padding: 0 11px;
+  font-size: 12px;
 }
 
 .notice {
@@ -460,11 +524,17 @@ button {
   width: 10px;
 }
 
-.grid-scroll::-webkit-scrollbar-thumb,
-.tag-list::-webkit-scrollbar-thumb {
+.grid-scroll::-webkit-scrollbar-thumb {
   background: #262c3b;
   border-radius: 999px;
   border: 3px solid var(--bg);
+}
+
+/* The lists live on the sidebar panel, not on the page background. */
+.tag-list::-webkit-scrollbar-thumb {
+  background: #2c3343;
+  border-radius: 999px;
+  border: 3px solid var(--panel);
 }
 
 .grid-inner {
@@ -653,6 +723,19 @@ button {
 .sheet-item {
   position: absolute;
   overflow: visible;
+  cursor: pointer;
+}
+
+/* The copy picked in the right-hand list wears a ring, so it is obvious which
+   piece the size and rotation buttons are working on. */
+.sheet-item.is-selected::after {
+  content: "";
+  position: absolute;
+  inset: -3px;
+  border-radius: 4px;
+  border: 2px solid var(--accent-2);
+  box-shadow: 0 0 0 2px rgba(34, 211, 238, 0.25);
+  pointer-events: none;
 }
 
 /* Centred by margins instead of a grid: a copy laid out turned has an art box
@@ -836,6 +919,152 @@ button {
   font-size: 11.5px;
 }
 
+/* Library archive: one row per sticker whose id is already here. */
+.archive-panel {
+  width: min(640px, 100%);
+}
+
+.archive-tools {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+.archive-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 8px;
+  border-radius: 8px;
+}
+
+.archive-row:hover {
+  background: var(--panel-2);
+}
+
+.archive-names {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  flex: 1;
+  min-width: 0;
+}
+
+.archive-name {
+  font-size: 12.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.archive-existing {
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.archive-choice {
+  height: 28px;
+  max-width: 190px;
+  border-radius: 8px;
+  padding: 0 6px;
+  font-size: 12px;
+  background: var(--panel-2);
+  border: 1px solid var(--line-soft);
+  color: var(--text);
+}
+
+.archive-actions {
+  display: flex;
+  gap: 8px;
+}
+
+/* Series review: find the same work spelled three ways and fold it. */
+.series-panel {
+  width: min(600px, 100%);
+}
+
+.series-headtext {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.series-note {
+  margin: 0;
+  max-width: 48ch;
+  line-height: 1.45;
+}
+
+.series-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.series-row:hover {
+  background: var(--panel-2);
+}
+
+.series-row.is-picked {
+  background: var(--accent-soft);
+  color: #d6c8ff;
+}
+
+.series-row input {
+  width: 15px;
+  height: 15px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.series-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.series-merge {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  border-top: 1px solid var(--line-soft);
+  padding-top: 10px;
+}
+
+.series-target {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  flex: 1;
+  min-width: 0;
+}
+
+.series-merge .primary-btn {
+  height: 34px;
+  white-space: nowrap;
+}
+
+.series-clear {
+  margin-left: 8px;
+}
+
+.heading-links {
+  display: flex;
+  gap: 8px;
+}
+
 .picker-message {
   display: grid;
   place-items: center;
@@ -911,7 +1140,6 @@ button {
   background: var(--panel-2);
   border: 1px solid var(--line-soft);
   color: var(--text);
-  outline: none;
 }
 
 .sheet-field select:focus {
@@ -987,8 +1215,60 @@ button {
   border-radius: 8px;
 }
 
+.copy-row {
+  cursor: pointer;
+}
+
 .copy-row:hover {
   background: var(--panel-2);
+}
+
+.copy-row.is-selected {
+  background: var(--accent-soft);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+/* Sheets kept inside the app. */
+.sheets-panel {
+  width: min(520px, 100%);
+}
+
+.sheets-name {
+  padding: 0 2px;
+}
+
+.saved-sheet-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 8px;
+  border-radius: 8px;
+}
+
+.saved-sheet-row:hover {
+  background: var(--panel-2);
+}
+
+.small-btn {
+  height: 28px;
+  padding: 0 12px;
+  font-size: 12.5px;
+}
+
+.sheet-name-chip {
+  max-width: 220px;
+  height: 22px;
+  padding: 0 8px;
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--text);
+  font-size: 11.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .copy-thumb {
@@ -1306,7 +1586,6 @@ button {
   border-radius: 9px;
   background: var(--panel-2);
   border: 1px solid var(--line-soft);
-  outline: none;
   user-select: text;
 }
 
@@ -1399,7 +1678,6 @@ button {
   min-width: 120px;
   background: none;
   border: none;
-  outline: none;
   font-size: 12px;
   user-select: text;
 }
@@ -1510,20 +1788,30 @@ button {
   min-height: 0;
   display: flex;
   flex-direction: column;
-  gap: 16px;
-  padding: 18px;
   border-radius: 14px;
   border: 1px solid var(--line);
   background: var(--panel);
   box-shadow: 0 30px 70px -30px #000;
-  overflow-y: auto;
+  overflow: hidden;
 }
 
+/* Header and run button stay put; only the keys and progress scroll. */
 .ai-head {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
   gap: 14px;
+  padding: 18px 18px 14px;
+}
+
+.ai-body {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0 18px 14px;
 }
 
 .ai-head h2 {
@@ -1681,10 +1969,9 @@ button {
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  padding: 12px 14px;
-  border: 1px solid var(--line-soft);
-  border-radius: 12px;
-  background: var(--panel-2);
+  padding: 14px 18px;
+  border-top: 1px solid var(--line-soft);
+  background: var(--panel);
 }
 
 .ai-note {
@@ -1724,4 +2011,105 @@ button {
 
 .wide-btn {
   width: 100%;
+}
+
+/* ---------- keyboard focus ---------- */
+
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid var(--accent-2);
+  outline-offset: 2px;
+}
+
+.search input:focus-visible {
+  outline-offset: -1px;
+}
+
+/* ---------- text that can be selected and copied again ---------- */
+
+p,
+h1,
+h2,
+h3,
+li,
+.muted,
+.toast,
+.copy-name,
+.card-size,
+.unplaced-chip,
+.detail-meta {
+  user-select: text;
+}
+
+/* ---------- tags that made the search match ---------- */
+
+.card-matches {
+  position: absolute;
+  left: 6px;
+  right: 6px;
+  bottom: 6px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  pointer-events: none;
+}
+
+.match-chip.is-facet {
+  color: #d6fbff;
+  background: rgba(14, 116, 144, 0.8);
+  border-color: rgba(125, 232, 247, 0.5);
+}
+
+.match-chip {
+  max-width: 100px;
+  overflow: hidden;
+  padding: 2px 6px;
+  border-radius: 6px;
+  font-size: 10px;
+  line-height: 1.3;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: #e9e2ff;
+  background: rgba(124, 92, 240, 0.72);
+  border: 1px solid rgba(190, 170, 255, 0.45);
+  backdrop-filter: blur(4px);
+}
+
+/* ---------- series and types ---------- */
+
+.field-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 118px;
+  gap: 8px;
+}
+
+.detail-tipo {
+  text-transform: capitalize;
+}
+
+/* Group headers painted inside the virtualised grid. */
+.grid-group {
+  position: absolute;
+  left: 14px;
+  right: 14px;
+  height: 36px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.grid-group-label {
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.7px;
+  text-transform: uppercase;
+  color: var(--text);
+}
+
+.grid-group-count {
+  font-size: 11px;
+  color: var(--muted);
 }

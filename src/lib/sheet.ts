@@ -1,13 +1,17 @@
 import type { Sticker } from "../types";
 import { round1 } from "./format";
 
-export type PaperId = "a4" | "letter";
+export type PaperId = "a4" | "letter" | "custom";
 export type Orientation = "portrait" | "landscape";
 
-export const PAPER_MM: Record<PaperId, { w: number; h: number }> = {
+export const PAPER_MM: Record<"a4" | "letter", { w: number; h: number }> = {
   a4: { w: 210, h: 297 },
   letter: { w: 215.9, h: 279.4 },
 };
+
+/** Bounds for a page the user measures out themselves, in millimetres. */
+export const MIN_PAPER_MM = 20;
+export const MAX_PAPER_MM = 2000;
 
 export interface SheetSettings {
   paper: PaperId;
@@ -17,6 +21,10 @@ export interface SheetSettings {
   cutLines: boolean;
   outlineWidthMm: number;
   outlinePadMm: number;
+  /** Page width used when `paper` is "custom", in millimetres. */
+  customWidthMm: number;
+  /** Page height used when `paper` is "custom", in millimetres. */
+  customHeightMm: number;
 }
 
 export const DEFAULT_SETTINGS: SheetSettings = {
@@ -27,6 +35,8 @@ export const DEFAULT_SETTINGS: SheetSettings = {
   cutLines: true,
   outlineWidthMm: 0.3,
   outlinePadMm: 1.5,
+  customWidthMm: 210,
+  customHeightMm: 297,
 };
 
 export const MIN_SIZE_MM = 1;
@@ -156,8 +166,18 @@ export function resizeCopy(
   return copy;
 }
 
+export function paperSize(settings: SheetSettings): { w: number; h: number } {
+  if (settings.paper === "custom") {
+    return {
+      w: clamp(settings.customWidthMm, MIN_PAPER_MM, MAX_PAPER_MM),
+      h: clamp(settings.customHeightMm, MIN_PAPER_MM, MAX_PAPER_MM),
+    };
+  }
+  return PAPER_MM[settings.paper];
+}
+
 export function pageDimensions(settings: SheetSettings): { w: number; h: number } {
-  const base = PAPER_MM[settings.paper];
+  const base = paperSize(settings);
   return settings.orientation === "landscape" ? { w: base.h, h: base.w } : { w: base.w, h: base.h };
 }
 

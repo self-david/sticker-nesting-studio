@@ -17,12 +17,24 @@ export interface Sticker {
   filePath: string;
   thumbPath: string;
   tags: string[];
+  /** The work or franchise, in one canonical spelling ("" = not classified yet). */
+  serie: string;
+  /** One of the closed family list ("" = not classified yet). */
+  tipo: string;
   /** When the AI last named and tagged this sticker (0 = never). */
   aiAt: number;
+  /** When the text classifier filled serie and tipo (0 = never). */
+  classifiedAt: number;
 }
 
 export interface TagCount {
   tag: string;
+  count: number;
+}
+
+/** One value of the series or type facet; "" is the «no series» bucket. */
+export interface FacetCount {
+  value: string;
   count: number;
 }
 

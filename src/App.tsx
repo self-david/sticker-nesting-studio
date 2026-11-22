@@ -1,25 +1,46 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { LibraryInfo, SortKey, Sticker, TagCount } from "./types";
+import type { FacetCount, LibraryInfo, SortKey, Sticker, TagCount } from "./types";
 import {
   PROJECT_EXTENSION,
+  aiClassify,
   aiDescribe,
+  askConfirm,
   deleteStickers,
+  exportLibraryArchive,
+  importLibraryArchive,
+  inspectLibraryArchive,
+  pickLibraryArchive,
+  pickLibraryExport,
+  type ArchiveAction,
+  type ArchiveConflict,
   importPaths,
   isTauri,
   libraryInfo,
+  listSeries,
   listStickers,
   listTags,
+  listTipos,
+  mergeSeries,
+  deleteSavedSheet,
+  listSavedSheets,
+  openSavedSheet,
   openSheetProject,
+  saveSavedSheet,
+  type SavedSheet,
   pickImages,
   pickProjectFile,
   pickProjectFolder,
   pickProjectToOpen,
   revealLibrary,
   saveSheetProject,
+  setStickerClassification,
+  setStickersClassification,
   setStickerTags,
   updateSticker,
 } from "./lib/api";
 import { useI18n } from "./lib/i18n";
+import { filterStickers, parseQuery } from "./lib/search";
+import { groupStickers, visualOrder, type GroupBy } from "./lib/group";
 import { forgetLastSheet, lastSheet, rememberLastSheet } from "./lib/recent";
 import {
   DEFAULT_SETTINGS,
@@ -34,7 +55,11 @@ import { Sidebar } from "./components/Sidebar";
 import { StickerGrid } from "./components/StickerGrid";
 import { DetailPanel } from "./components/DetailPanel";
 import { SheetView } from "./components/SheetView";
+import { SavedSheetsPanel } from "./components/SavedSheetsPanel";
 import { AiPanel } from "./components/AiPanel";
+import { SeriesPanel } from "./components/SeriesPanel";
+import { LibraryArchivePanel } from "./components/LibraryArchivePanel";
+import { BulkClassification } from "./components/BulkClassification";
 
 interface Toast {
   kind: "ok" | "err";
@@ -44,13 +69,17 @@ interface Toast {
 export default function App() {
   const { t } = useI18n();
   const [view, setView] = useState<"library" | "sheet">("library");
-  const [stickers, setStickers] = useState<Sticker[]>([]);
+  const [all, setAll] = useState<Sticker[]>([]);
   const [tags, setTags] = useState<TagCount[]>([]);
   const [info, setInfo] = useState<LibraryInfo | null>(null);
   const [query, setQuery] = useState("");
-  const [debounced, setDebounced] = useState("");
   const [sort, setSort] = useState<SortKey>("recent");
   const [activeTags, setActiveTags] = useState<string[]>([]);
+  const [series, setSeries] = useState<FacetCount[]>([]);
+  const [tipos, setTipos] = useState<FacetCount[]>([]);
+  const [activeSerie, setActiveSerie] = useState<string | null>(null);
+  const [activeTipo, setActiveTipo] = useState<string | null>(null);
+  const [groupBy, setGroupBy] = useState<GroupBy | "none">("none");
   const [selection, setSelection] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [importing, setImporting] = useState(false);
@@ -58,15 +87,42 @@ export default function App() {
   const [toast, setToast] = useState<Toast | null>(null);
   const [sheetCopies, setSheetCopies] = useState<SheetCopy[]>([]);
   const [sheetSettings, setSheetSettings] = useState<SheetSettings>(DEFAULT_SETTINGS);
+  // Sheets kept in the library: the id is set once saved, so saving again
+  // rewrites the same one instead of piling up copies.
+  const [savedSheets, setSavedSheets] = useState<SavedSheet[]>([]);
+  const [sheetId, setSheetId] = useState<string | null>(null);
+  const [sheetName, setSheetName] = useState("");
+  const [sheetsPanel, setSheetsPanel] = useState<"open" | "save" | null>(null);
+  const [sheetsBusy, setSheetsBusy] = useState(false);
   const [aiOpen, setAiOpen] = useState(false);
+  const [seriesOpen, setSeriesOpen] = useState(false);
+  const [merging, setMerging] = useState(false);
+  const [archiveBusy, setArchiveBusy] = useState(false);
+  const [archivePeek, setArchivePeek] = useState<{
+    path: string;
+    total: number;
+    conflicts: ArchiveConflict[];
+  } | null>(null);
   const [aiPending, setAiPending] = useState<Sticker[]>([]);
   const [aiBusyId, setAiBusyId] = useState<string | null>(null);
   const anchorRef = useRef<string | null>(null);
 
-  useEffect(() => {
-    const id = window.setTimeout(() => setDebounced(query), 180);
-    return () => window.clearTimeout(id);
-  }, [query]);
+  // The library sits in memory: typing filters it without another SQLite trip.
+  const parsed = useMemo(() => parseQuery(query), [query]);
+  const stickers = useMemo(
+    () => filterStickers(all, parsed, { tags: activeTags, serie: activeSerie, tipo: activeTipo }),
+    [all, parsed, activeTags, activeSerie, activeTipo],
+  );
+  // Grouping reorders what is painted, so shift-click walks the visual order.
+  const groups = useMemo(() => {
+    if (groupBy === "none") return [{ key: "", label: "", items: stickers }];
+    return groupStickers(stickers, groupBy).map((group) => ({
+      key: group.key,
+      items: group.items,
+      label: group.key || (groupBy === "serie" ? t("facet.noSerie") : t("facet.noTipo")),
+    }));
+  }, [stickers, groupBy, t]);
+  const ordered = useMemo(() => visualOrder(groups), [groups]);
 
   const reload = useCallback(async () => {
     if (!isTauri) {
@@ -74,20 +130,24 @@ export default function App() {
       return;
     }
     try {
-      const [list, tagList, lib] = await Promise.all([
-        listStickers(debounced, activeTags, sort),
+      const [list, tagList, serieList, tipoList, lib] = await Promise.all([
+        listStickers("", [], sort),
         listTags(),
+        listSeries(),
+        listTipos(),
         libraryInfo(),
       ]);
-      setStickers(list);
+      setAll(list);
       setTags(tagList);
+      setSeries(serieList);
+      setTipos(tipoList);
       setInfo(lib);
     } catch (err) {
       setToast({ kind: "err", text: String(err) });
     } finally {
       setLoading(false);
     }
-  }, [debounced, activeTags, sort]);
+  }, [sort]);
 
   useEffect(() => {
     void reload();
@@ -184,25 +244,25 @@ export default function App() {
           return prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id];
         }
         if (range && anchorRef.current) {
-          const a = stickers.findIndex((s) => s.id === anchorRef.current);
-          const b = stickers.findIndex((s) => s.id === id);
+          const a = ordered.findIndex((s) => s.id === anchorRef.current);
+          const b = ordered.findIndex((s) => s.id === id);
           if (a >= 0 && b >= 0) {
             const [from, to] = a < b ? [a, b] : [b, a];
-            return stickers.slice(from, to + 1).map((s) => s.id);
+            return ordered.slice(from, to + 1).map((s) => s.id);
           }
         }
         anchorRef.current = id;
         return [id];
       });
     },
-    [stickers],
+    [ordered],
   );
 
   const patchSticker = useCallback(
     async (id: string, patch: { name?: string; widthMm?: number; heightMm?: number }) => {
       try {
         await updateSticker(id, patch);
-        setStickers((prev) => prev.map((s) => (s.id === id ? { ...s, ...patch } : s)));
+        setAll((prev) => prev.map((s) => (s.id === id ? { ...s, ...patch } : s)));
       } catch (err) {
         setToast({ kind: "err", text: String(err) });
         await reload();
@@ -215,7 +275,7 @@ export default function App() {
     async (id: string, next: string[]) => {
       try {
         const clean = await setStickerTags(id, next);
-        setStickers((prev) => prev.map((s) => (s.id === id ? { ...s, tags: clean } : s)));
+        setAll((prev) => prev.map((s) => (s.id === id ? { ...s, tags: clean } : s)));
         setTags(await listTags());
       } catch (err) {
         setToast({ kind: "err", text: String(err) });
@@ -248,10 +308,159 @@ export default function App() {
     [reload, t],
   );
 
+  const patchClassification = useCallback(
+    async (id: string, serie: string, tipo: string) => {
+      try {
+        await setStickerClassification(id, serie, tipo);
+        setAll((prev) => prev.map((s) => (s.id === id ? { ...s, serie, tipo } : s)));
+        setSeries(await listSeries());
+        setTipos(await listTipos());
+      } catch (err) {
+        setToast({ kind: "err", text: String(err) });
+      }
+    },
+    [],
+  );
+
+  // One serie or type for the whole selection, from the bar above the grid.
+  const classifySelection = useCallback(
+    async (patch: { serie?: string; tipo?: string }) => {
+      if (!selection.length) return;
+      try {
+        const changed = await setStickersClassification(selection, patch);
+        // One reload keeps cards and both facet lists in step with SQLite.
+        await reload();
+        setToast({ kind: "ok", text: t("selection.applied", { n: changed }) });
+      } catch (err) {
+        setToast({ kind: "err", text: String(err) });
+      }
+    },
+    [reload, selection, t],
+  );
+
+  // Folding series into one name; the facet that was active follows the merge.
+  const mergeInto = useCallback(
+    async (from: string[], into: string) => {
+      setMerging(true);
+      try {
+        const moved = await mergeSeries(from, into);
+        const name = into.trim();
+        if (activeSerie !== null && from.includes(activeSerie)) setActiveSerie(name);
+        await reload();
+        setToast({ kind: "ok", text: t("series.merged", { n: moved, name }) });
+      } catch (err) {
+        setToast({ kind: "err", text: String(err) });
+      } finally {
+        setMerging(false);
+      }
+    },
+    [activeSerie, reload, t],
+  );
+
+  // The whole library travels as one .zip, artwork and manifest.
+  const exportArchive = useCallback(async () => {
+    try {
+      const destination = await pickLibraryExport(
+        t("library.exportTitle"),
+        "biblioteca-stickers.zip",
+      );
+      if (!destination) return;
+      setArchiveBusy(true);
+      const saved = await exportLibraryArchive(destination);
+      setToast({ kind: "ok", text: t("library.exported", { path: saved }) });
+    } catch (err) {
+      setToast({ kind: "err", text: String(err) });
+    } finally {
+      setArchiveBusy(false);
+    }
+  }, [t]);
+
+  const runArchiveImport = useCallback(
+    async (path: string, decisions: { id: string; action: ArchiveAction }[]) => {
+      setArchiveBusy(true);
+      try {
+        const report = await importLibraryArchive(path, decisions);
+        await reload();
+        await refreshPending();
+        setArchivePeek(null);
+        if (report.failures.length > 0) {
+          setToast({
+            kind: "err",
+            text: t("archive.failed", {
+              n: report.failures.length,
+              message: report.failures[0].message,
+            }),
+          });
+        } else {
+          setToast({
+            kind: "ok",
+            text: t("archive.done", {
+              imported: report.imported,
+              replaced: report.replaced,
+              duplicated: report.duplicated,
+              skipped: report.skipped,
+            }),
+          });
+        }
+      } catch (err) {
+        setToast({ kind: "err", text: String(err) });
+      } finally {
+        setArchiveBusy(false);
+      }
+    },
+    [reload, refreshPending, t],
+  );
+
+  // With no collisions the archive goes in straight away; otherwise the window
+  // asks sticker by sticker before writing anything.
+  const startArchiveImport = useCallback(async () => {
+    let path: string | null = null;
+    try {
+      path = await pickLibraryArchive(t("library.importTitle"));
+    } catch (err) {
+      setToast({ kind: "err", text: String(err) });
+      return;
+    }
+    if (!path) return;
+    setArchiveBusy(true);
+    try {
+      const peek = await inspectLibraryArchive(path);
+      if (peek.conflicts.length === 0) {
+        await runArchiveImport(path, []);
+      } else {
+        setArchivePeek({ path, total: peek.total, conflicts: peek.conflicts });
+      }
+    } catch (err) {
+      setToast({ kind: "err", text: String(err) });
+    } finally {
+      setArchiveBusy(false);
+    }
+  }, [runArchiveImport, t]);
+
+  // Text-only classification of the whole library: names and tags stay as they are.
+  const classifyStickers = useCallback(async () => {
+    try {
+      const report = await aiClassify();
+      await reload();
+      if (report.updated.length > 0) {
+        setToast({ kind: "ok", text: t("ai.classifyDone", { n: report.updated.length }) });
+      } else if (report.failures.length > 0) {
+        setToast({
+          kind: "err",
+          text: t("ai.classifyFailed", { message: report.failures[0].message }),
+        });
+      } else {
+        setToast({ kind: "ok", text: t("ai.classifyNone") });
+      }
+    } catch (err) {
+      setToast({ kind: "err", text: t("ai.classifyFailed", { message: String(err) }) });
+    }
+  }, [reload, t]);
+
   const removeSelection = useCallback(
     async (ids: string[]) => {
       if (!ids.length) return;
-      const ok = window.confirm(t("detail.deleteConfirm", { n: ids.length }));
+      const ok = await askConfirm(t("detail.deleteConfirm", { n: ids.length }));
       if (!ok) return;
       try {
         await deleteStickers(ids);
@@ -353,13 +562,45 @@ export default function App() {
     }
   }, [sheetCopies, sheetSettings, t]);
 
+  const refreshSheets = useCallback(async () => {
+    if (!isTauri) return;
+    try {
+      setSavedSheets(await listSavedSheets());
+    } catch {
+      // The list is only a shortcut; failing to load it never blocks the sheet.
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshSheets();
+  }, [refreshSheets]);
+
+  // The sheet keeps the names it was saved with; show today's library names
+  // instead, so a copy list never reads like «path8424».
+  const withLibraryNames = useCallback(async (copies: SheetCopy[]) => {
+    try {
+      const all = await listStickers("", [], "recent");
+      const names = new Map(all.map((s) => [s.id, s.name]));
+      return copies.map((copy) => {
+        const name = names.get(copy.stickerId);
+        return name && name !== copy.name ? { ...copy, name } : copy;
+      });
+    } catch {
+      // The library is not ready; the saved names are still usable.
+      return copies;
+    }
+  }, []);
+
   // Replaces the sheet on screen. Anything already laid out is only dropped
   // after the user agrees, so a restore or an open never loses work silently.
   const loadProject = useCallback(
     async (path: string, announce: boolean) => {
-      if (sheetCopies.length > 0 && !window.confirm(t("sheet.openConfirm"))) return;
+      if (sheetCopies.length > 0 && !(await askConfirm(t("sheet.openConfirm")))) return;
       const project = await openSheetProject(path);
-      setSheetCopies(project.copies);
+      const copies = await withLibraryNames(project.copies);
+      setSheetId(null);
+      setSheetName("");
+      setSheetCopies(copies);
       setSheetSettings(project.settings);
       setView("sheet");
       rememberLastSheet(project.convertedTo ?? path);
@@ -371,7 +612,89 @@ export default function App() {
           : t("sheet.loaded", { n: project.copies.length }),
       });
     },
-    [sheetCopies.length, t],
+    [sheetCopies.length, t, withLibraryNames],
+  );
+
+  // Saves into the library database: nothing leaves the app and the sheet is
+  // still editable next time it is opened.
+  const saveLocalSheet = useCallback(
+    async (name: string) => {
+      if (!sheetCopies.length) {
+        setToast({ kind: "err", text: t("sheet.saveEmpty") });
+        return;
+      }
+      setSheetsBusy(true);
+      try {
+        const saved = await saveSavedSheet(sheetId, name, sheetSettings, sheetCopies);
+        setSheetId(saved.id);
+        setSheetName(saved.name);
+        setSheetsPanel(null);
+        await refreshSheets();
+        setToast({ kind: "ok", text: t("sheet.savedLocal", { name: saved.name }) });
+      } catch (err) {
+        setToast({ kind: "err", text: String(err) });
+      } finally {
+        setSheetsBusy(false);
+      }
+    },
+    [refreshSheets, sheetCopies, sheetId, sheetSettings, t],
+  );
+
+  // An already saved sheet is overwritten in place; a new one asks for a name.
+  const beginSaveLocal = useCallback(() => {
+    if (!sheetCopies.length) {
+      setToast({ kind: "err", text: t("sheet.saveEmpty") });
+      return;
+    }
+    if (sheetId) void saveLocalSheet(sheetName);
+    else setSheetsPanel("save");
+  }, [saveLocalSheet, sheetCopies.length, sheetId, sheetName, t]);
+
+  const openLocalSheet = useCallback(
+    async (sheet: SavedSheet) => {
+      if (sheetCopies.length > 0 && !(await askConfirm(t("sheet.openConfirm")))) return;
+      setSheetsBusy(true);
+      try {
+        const project = await openSavedSheet(sheet.id);
+        const copies = await withLibraryNames(project.copies);
+        setSheetCopies(copies);
+        setSheetSettings(project.settings);
+        setSheetId(sheet.id);
+        setSheetName(sheet.name);
+        setSheetsPanel(null);
+        setView("sheet");
+        setToast({
+          kind: "ok",
+          text: t("sheet.openedLocal", { name: sheet.name, n: copies.length }),
+        });
+      } catch (err) {
+        setToast({ kind: "err", text: String(err) });
+      } finally {
+        setSheetsBusy(false);
+      }
+    },
+    [sheetCopies.length, t, withLibraryNames],
+  );
+
+  const removeLocalSheet = useCallback(
+    async (sheet: SavedSheet) => {
+      if (!(await askConfirm(t("sheet.sheetsDeleteConfirm", { name: sheet.name })))) return;
+      setSheetsBusy(true);
+      try {
+        await deleteSavedSheet(sheet.id);
+        if (sheetId === sheet.id) {
+          setSheetId(null);
+          setSheetName("");
+        }
+        await refreshSheets();
+        setToast({ kind: "ok", text: t("sheet.sheetDeleted", { name: sheet.name }) });
+      } catch (err) {
+        setToast({ kind: "err", text: String(err) });
+      } finally {
+        setSheetsBusy(false);
+      }
+    },
+    [refreshSheets, sheetId, t],
   );
 
   // A `.sns` file, or a folder saved with the previous format (converted on open).
@@ -423,8 +746,13 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, [selection, removeSelection, view]);
 
-  const countLabel =
-    info && info.count === 1 ? t("library.countOne") : t("library.count", { n: info?.count ?? 0 });
+  const filtering =
+    parsed.active || activeTags.length > 0 || activeSerie !== null || activeTipo !== null;
+  const countLabel = filtering
+    ? t("library.countFiltered", { n: stickers.length, total: info?.count ?? 0 })
+    : info && info.count === 1
+      ? t("library.countOne")
+      : t("library.count", { n: info?.count ?? 0 });
 
   return (
     <div className="app">
@@ -435,9 +763,19 @@ export default function App() {
         activeTags={activeTags}
         onToggleTag={toggleTag}
         onClearTags={() => setActiveTags([])}
+        series={series}
+        tipos={tipos}
+        activeSerie={activeSerie}
+        activeTipo={activeTipo}
+        onSelectSerie={setActiveSerie}
+        onSelectTipo={setActiveTipo}
+        onReviewSeries={() => setSeriesOpen(true)}
         info={info}
         sheetCount={sheetCopies.length}
         onOpenFolder={() => void revealLibrary()}
+        onExportLibrary={() => void exportArchive()}
+        onImportLibrary={() => void startArchiveImport()}
+        archiveBusy={archiveBusy}
         aiPending={aiPending.length}
         onOpenAi={() => setAiOpen(true)}
       />
@@ -453,6 +791,12 @@ export default function App() {
             onUpdateCopy={updateCopy}
             onDuplicate={duplicateCopy}
             onRotate={spinCopy}
+            sheetName={sheetName}
+            onSaveLocal={beginSaveLocal}
+            onOpenSheets={() => {
+              setSheetsPanel("open");
+              void refreshSheets();
+            }}
             onSaveProject={() => void saveProject()}
             onOpenProject={() => void openProject("file")}
             onOpenProjectFolder={() => void openProject("folder")}
@@ -472,6 +816,7 @@ export default function App() {
                   value={query}
                   onChange={(e) => setQuery(e.target.value)}
                   placeholder={t("search.placeholder")}
+                  title={t("search.hint")}
                   spellCheck={false}
                 />
                 {query && (
@@ -483,6 +828,17 @@ export default function App() {
 
               <div className="toolbar-right">
                 <span className="count-label">{countLabel}</span>
+                <label className="sort">
+                  <span>{t("group.label")}</span>
+                  <select
+                    value={groupBy}
+                    onChange={(e) => setGroupBy(e.target.value as GroupBy | "none")}
+                  >
+                    <option value="none">{t("group.none")}</option>
+                    <option value="serie">{t("group.serie")}</option>
+                    <option value="tipo">{t("group.tipo")}</option>
+                  </select>
+                </label>
                 <label className="sort">
                   <span>{t("sort.label")}</span>
                   <select value={sort} onChange={(e) => setSort(e.target.value as SortKey)}>
@@ -501,18 +857,24 @@ export default function App() {
               <div className="selection-bar">
                 <span>
                   {selection.length === 1
-                    ? t("selection.n", { n: 1 })
+                    ? t("selection.one")
                     : t("selection.n", { n: selection.length })}
                 </span>
-                <button className="ghost-btn" onClick={() => addSelectionToSheet(1)}>
-                  {t("selection.addSheet", { n: selection.length })}
-                </button>
-                <button className="ghost-btn" onClick={() => void removeSelection(selection)}>
-                  {t("selection.delete")}
-                </button>
-                <button className="link-btn" onClick={() => setSelection([])}>
-                  {t("selection.clear")}
-                </button>
+                <BulkClassification
+                  series={series}
+                  onApply={(patch) => void classifySelection(patch)}
+                />
+                <div className="selection-actions">
+                  <button className="ghost-btn" onClick={() => addSelectionToSheet(1)}>
+                    {t("selection.addSheet", { n: selection.length })}
+                  </button>
+                  <button className="ghost-btn" onClick={() => void removeSelection(selection)}>
+                    {t("selection.delete")}
+                  </button>
+                  <button className="link-btn" onClick={() => setSelection([])}>
+                    {t("selection.clear")}
+                  </button>
+                </div>
               </div>
             )}
 
@@ -533,16 +895,12 @@ export default function App() {
                     </svg>
                   </div>
                   <h2>
-                    {query || activeTags.length
-                      ? t("library.emptyFiltered.title")
-                      : t("library.empty.title")}
+                    {filtering ? t("library.emptyFiltered.title") : t("library.empty.title")}
                   </h2>
                   <p>
-                    {query || activeTags.length
-                      ? t("library.emptyFiltered.body")
-                      : t("library.empty.body")}
+                    {filtering ? t("library.emptyFiltered.body") : t("library.empty.body")}
                   </p>
-                  {!(query || activeTags.length) && (
+                  {!filtering && (
                     <>
                       <button className="primary-btn" onClick={handleImportClick} disabled={!isTauri}>
                         {t("import.button")}
@@ -554,8 +912,10 @@ export default function App() {
               </div>
             ) : (
               <StickerGrid
-                items={stickers}
+                groups={groups}
+                showHeaders={groupBy !== "none"}
                 selected={selectedSet}
+                query={parsed.active ? parsed : undefined}
                 onSelect={handleSelect}
                 onAdd={(sticker) => addStickerCopies(sticker, 1)}
               />
@@ -577,9 +937,43 @@ export default function App() {
           onClose={() => setSelection([])}
           onPatch={patchSticker}
           onTags={updateTags}
+          series={series}
+          onClassification={patchClassification}
           onDelete={(id) => void removeSelection(selection.length ? selection : [id])}
           onAi={(id) => void describeOne(id)}
           aiBusy={aiBusyId === detailSticker.id}
+        />
+      )}
+
+      {sheetsPanel && (
+        <SavedSheetsPanel
+          mode={sheetsPanel}
+          sheets={savedSheets}
+          defaultName={sheetName || t("sheet.sheetNamePlaceholder")}
+          busy={sheetsBusy}
+          onClose={() => setSheetsPanel(null)}
+          onSave={(name) => void saveLocalSheet(name)}
+          onOpen={(sheet) => void openLocalSheet(sheet)}
+          onDelete={(sheet) => void removeLocalSheet(sheet)}
+        />
+      )}
+
+      {archivePeek && (
+        <LibraryArchivePanel
+          total={archivePeek.total}
+          conflicts={archivePeek.conflicts}
+          busy={archiveBusy}
+          onClose={() => setArchivePeek(null)}
+          onImport={(decisions) => void runArchiveImport(archivePeek.path, decisions)}
+        />
+      )}
+
+      {seriesOpen && (
+        <SeriesPanel
+          series={series}
+          busy={merging}
+          onClose={() => setSeriesOpen(false)}
+          onMerge={(from, into) => void mergeInto(from, into)}
         />
       )}
 
@@ -588,6 +982,8 @@ export default function App() {
         pending={aiPending}
         total={info?.count ?? 0}
         onClose={() => setAiOpen(false)}
+        unclassified={all.filter((s) => !s.classifiedAt).length}
+        onClassify={classifyStickers}
         onUpdated={async () => {
           await reload();
           await refreshPending();

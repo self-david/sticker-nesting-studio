@@ -2,7 +2,9 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { Sticker } from "../types";
 import type { SheetCopy, SheetSettings } from "../lib/sheet";
 import {
+  MAX_PAPER_MM,
   MAX_SIZE_MM,
+  MIN_PAPER_MM,
   MIN_SIZE_MM,
   clamp,
   layoutSheet,
@@ -41,6 +43,12 @@ interface Props {
   onRotate: (id: string) => void;
   onSaveProject: () => void;
   onOpenProject: () => void;
+  /** Name of the sheet saved inside the app, empty when it has none yet. */
+  sheetName: string;
+  onSaveLocal: () => void;
+  onOpenSheets: () => void;
+  /** Asks the user and resolves once one of the buttons is pressed. */
+  onConfirm: (message: string) => Promise<boolean>;
   onOpenProjectFolder: () => void;
   onRemove: (id: string) => void;
   onClear: () => void;
@@ -129,6 +137,10 @@ export function SheetView({
   onRotate,
   onSaveProject,
   onOpenProject,
+  sheetName,
+  onSaveLocal,
+  onOpenSheets,
+  onConfirm,
   onOpenProjectFolder,
   onRemove,
   onClear,
@@ -141,6 +153,7 @@ export function SheetView({
   const [stage, setStage] = useState({ w: 0, h: 0 });
   const [pickerOpen, setPickerOpen] = useState(false);
   const [pageIndex, setPageIndex] = useState(0);
+  const [selected, setSelected] = useState<string | null>(null);
   const [exporting, setExporting] = useState(false);
   const [contours, setContours] = useState<Record<string, ContourPolygon[]>>(() =>
     cachedContours(),
@@ -186,7 +199,23 @@ export function SheetView({
       ? Math.max(0.08, Math.min((stage.w - 56) / layout.pageW, (stage.h - 56) / layout.pageH, 3.5))
       : 1;
   const paperLabel =
-    settings.paper === "a4" ? t("sheet.paper.a4") : t("sheet.paper.letter");
+    settings.paper === "custom"
+      ? `${t("sheet.paper.custom")} ${fmtMm(settings.customWidthMm, locale)} × ${fmtMm(settings.customHeightMm, locale)} mm`
+      : settings.paper === "a4"
+        ? t("sheet.paper.a4")
+        : t("sheet.paper.letter");
+
+  // A copy removed on its own must not leave the highlight hanging.
+  useEffect(() => {
+    if (selected && !copies.some((copy) => copy.id === selected)) setSelected(null);
+  }, [copies, selected]);
+
+  /** Marks the copy and jumps to the page it was placed on. */
+  const selectCopy = (id: string) => {
+    setSelected(id);
+    const page = layout.pages.findIndex((placed) => placed.some((p) => p.copy.id === id));
+    if (page >= 0 && page !== currentIndex) setPageIndex(page);
+  };
 
   const marginLimit = maxMarginMm(layout.pageW, layout.pageH);
 
@@ -259,7 +288,7 @@ export function SheetView({
   const handleExport = async () => {
     if (exporting || exportPages.length === 0) return;
     if (layout.unplaced.length > 0) {
-      const proceed = window.confirm(
+      const proceed = await onConfirm(
         t("sheet.exportPartial", { n: layout.unplaced.length, placed: stats.placed }),
       );
       if (!proceed) return;
@@ -295,10 +324,22 @@ export function SheetView({
               h: fmtMm(layout.areaH, locale),
             })}
           </span>
+          {sheetName && <span className="sheet-name-chip">{sheetName}</span>}
         </div>
         <div className="toolbar-right">
           <button className="ghost-btn" onClick={onGoLibrary}>
             {t("sheet.goLibrary")}
+          </button>
+          <button
+            className="ghost-btn"
+            onClick={onSaveLocal}
+            disabled={copies.length === 0}
+            title={t("sheet.saveLocalHint")}
+          >
+            {t("sheet.saveLocal")}
+          </button>
+          <button className="ghost-btn" onClick={onOpenSheets} title={t("sheet.sheetsTitle")}>
+            {t("sheet.mySheets")}
           </button>
           <button
             className="ghost-btn"
@@ -378,7 +419,8 @@ export function SheetView({
                 return (
                   <div
                     key={p.copy.id}
-                    className="sheet-item"
+                    className={`sheet-item${p.copy.id === selected ? " is-selected" : ""}`}
+                    onClick={() => setSelected(p.copy.id)}
                     style={{
                       left: p.x * scale,
                       top: p.y * scale,
@@ -479,8 +521,52 @@ export function SheetView({
               >
                 <option value="a4">{t("sheet.paper.a4")} · 210 × 297 mm</option>
                 <option value="letter">{t("sheet.paper.letter")} · 215,9 × 279,4 mm</option>
+                <option value="custom">{t("sheet.paper.custom")}</option>
               </select>
             </label>
+
+            {settings.paper === "custom" && (
+              <div className="sheet-two">
+                <label className="sheet-field">
+                  <span className="field-label">{t("sheet.customW")}</span>
+                  <div className="input-unit">
+                    <MmInput
+                      value={settings.customWidthMm}
+                      min={MIN_PAPER_MM}
+                      max={MAX_PAPER_MM}
+                      ariaLabel={t("sheet.customW")}
+                      onCommit={(v) => {
+                        const next = pageDimensions({ ...settings, customWidthMm: v });
+                        onSettings({
+                          customWidthMm: v,
+                          marginMm: Math.min(settings.marginMm, maxMarginMm(next.w, next.h)),
+                        });
+                      }}
+                    />
+                    <span className="unit">{t("unit.mm")}</span>
+                  </div>
+                </label>
+                <label className="sheet-field">
+                  <span className="field-label">{t("sheet.customH")}</span>
+                  <div className="input-unit">
+                    <MmInput
+                      value={settings.customHeightMm}
+                      min={MIN_PAPER_MM}
+                      max={MAX_PAPER_MM}
+                      ariaLabel={t("sheet.customH")}
+                      onCommit={(v) => {
+                        const next = pageDimensions({ ...settings, customHeightMm: v });
+                        onSettings({
+                          customHeightMm: v,
+                          marginMm: Math.min(settings.marginMm, maxMarginMm(next.w, next.h)),
+                        });
+                      }}
+                    />
+                    <span className="unit">{t("unit.mm")}</span>
+                  </div>
+                </label>
+              </div>
+            )}
 
             <div className="sheet-field">
               <span className="field-label">{t("sheet.orientation")}</span>
@@ -584,7 +670,11 @@ export function SheetView({
           <div className="copy-list">
             {copies.length === 0 && <p className="muted small copy-empty">{t("sheet.copiesNone")}</p>}
             {copies.map((copy) => (
-              <div className="copy-row" key={copy.id}>
+              <div
+                className={`copy-row${copy.id === selected ? " is-selected" : ""}`}
+                key={copy.id}
+                onClick={() => selectCopy(copy.id)}
+              >
                 <div className="copy-thumb">
                   <Thumb src={assetUrl(copy.thumbPath)} ext={copy.ext} alt={copy.name} compact />
                 </div>

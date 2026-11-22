@@ -10,9 +10,26 @@ use std::time::Duration;
 pub const DEFAULT_MODEL: &str = "qwen/qwen3.8-27b";
 const ENDPOINT: &str = "https://api.groq.com/openai/v1/chat/completions";
 const MAX_NAME_CHARS: usize = 60;
+const MAX_SERIE_CHARS: usize = 60;
 const MAX_KEY_NAME_CHARS: usize = 40;
 
-const SYSTEM: &str = "Eres un catalogador de pegatinas para una biblioteca personal. \
+/// The closed list of families a sticker can belong to. A model answer outside
+/// this list never creates a new family: it falls back to `otros`.
+pub const TIPOS: [&str; 11] = [
+    "anime",
+    "comic",
+    "cartoon",
+    "videojuego",
+    "cine",
+    "terror",
+    "fantasia",
+    "kawaii",
+    "cotidiano",
+    "frase",
+    "otros",
+];
+
+pub const SYSTEM: &str = "Eres un catalogador de pegatinas para una biblioteca personal. \
 Muchas son personajes de películas, series, anime, videojuegos y cómics. \
 Miras la imagen y respondes solo con JSON válido.";
 
@@ -20,9 +37,12 @@ const PROMPT: &str = "Mira este sticker.\n\
 Si reconoces a un personaje conocido (película, serie, anime, videojuego, cómic), nómbralo con su nombre propio \
 («Sombrerero loco», «Hello Kitty», «Pikachu») y pon la obra entre las etiquetas.\n\
 Si no lo reconoces, describe lo que se ve.\n\
-Devuelve SOLO este JSON: {\"name\": \"...\", \"tags\": [\"...\"]}.\n\
+Devuelve SOLO este JSON: {\"name\": \"...\", \"serie\": \"...\", \"tipo\": \"...\", \"tags\": [\"...\"]}.\n\
 - name: de 2 a 5 palabras en español. Personaje reconocido: su nombre. Si no, qué se ve. Sin comillas ni emojis.\n\
-- tags: de 3 a 6 etiquetas en español, en minúsculas: personaje, obra, tema, objeto, animal, estilo o color dominante.";
+- serie: la obra o franquicia a la que pertenece (película, serie, anime, videojuego, cómic), con su forma más conocida. \
+Cadena vacía si no la reconoces con seguridad; no la inventes.\n\
+- tipo: exactamente uno de: anime, comic, cartoon, videojuego, cine, terror, fantasia, kawaii, cotidiano, frase, otros.\n\
+- tags: de 3 a 6 etiquetas en español, en minúsculas: tema, objeto, animal, estilo o color dominante. No repitas la serie entre las etiquetas.";
 
 /// One saved key. The secret stays here, in Rust: the webview only sees a tail.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,6 +101,12 @@ struct Store {
 pub struct Answer {
     #[serde(default)]
     pub name: String,
+    /// The work or franchise, already cleaned: empty when the model is not sure.
+    #[serde(default)]
+    pub serie: String,
+    /// One of `TIPOS`, or empty when the model left it out.
+    #[serde(default)]
+    pub tipo: String,
     #[serde(default)]
     pub tags: Vec<String>,
 }
@@ -327,27 +353,36 @@ pub fn prepare(source: &AiSource) -> Result<Prepared, String> {
     })
 }
 
-/// Asks the model for a name and tags for one sticker, using one key.
-pub async fn describe(
+/// One request: who the model is, what it gets and how much it may answer.
+pub struct Chat<'a> {
+    pub model: &'a str,
+    pub system: &'a str,
+    pub content: serde_json::Value,
+    pub max_tokens: u32,
+}
+
+/// The user content for the vision call: the instructions plus the artwork.
+pub fn vision_content(image: &Prepared) -> serde_json::Value {
+    serde_json::json!([
+        { "type": "text", "text": PROMPT },
+        { "type": "image_url", "image_url": { "url": image.url.clone() } }
+    ])
+}
+
+/// Sends one chat to Groq with one key and returns the raw content it wrote.
+pub async fn complete(
     client: &reqwest::Client,
     key: &StoredKey,
-    model: &str,
-    image: &Prepared,
-) -> Result<Answer, CallError> {
+    chat: &Chat<'_>,
+) -> Result<String, CallError> {
     let body = serde_json::json!({
-        "model": model,
+        "model": chat.model,
         "temperature": 0.2,
-        "max_tokens": 300,
+        "max_tokens": chat.max_tokens,
         "response_format": { "type": "json_object" },
         "messages": [
-            { "role": "system", "content": SYSTEM },
-            {
-                "role": "user",
-                "content": [
-                    { "type": "text", "text": PROMPT },
-                    { "type": "image_url", "image_url": { "url": image.url.clone() } }
-                ]
-            }
+            { "role": "system", "content": chat.system },
+            { "role": "user", "content": chat.content }
         ]
     });
 
@@ -381,16 +416,130 @@ pub async fn describe(
         serde_json::from_str(&text).map_err(|e| CallError::Other(format!("Respuesta ilegible de Groq: {e}")))?;
     let content = payload["choices"][0]["message"]["content"]
         .as_str()
-        .ok_or_else(|| CallError::Other("Groq no devolvió ninguna descripción".to_string()))?;
+        .ok_or_else(|| CallError::Other("Groq no devolvió ninguna respuesta".to_string()))?;
+    Ok(content.to_string())
+}
 
-    let answer = parse_answer(content)
-        .ok_or_else(|| CallError::Other("La IA no devolvió un nombre válido".to_string()))?;
+/// The cleaned name, series and type for one sticker, from the raw answer.
+pub fn answer_from(raw: &str) -> Result<Answer, String> {
+    let answer =
+        parse_answer(raw).ok_or_else(|| "La IA no devolvió un nombre válido".to_string())?;
     let name = clean_name(&answer.name)
-        .ok_or_else(|| CallError::Other("La IA no devolvió un nombre válido".to_string()))?;
+        .ok_or_else(|| "La IA no devolvió un nombre válido".to_string())?;
     Ok(Answer {
         name,
+        serie: clean_serie(&answer.serie).unwrap_or_default(),
+        tipo: clean_tipo(&answer.tipo),
         tags: answer.tags,
     })
+}
+
+// ---------- series and types, without reading the image again ----------
+
+/// How many stickers one classification request carries.
+pub const CLASSIFY_BATCH: usize = 25;
+pub const CLASSIFY_MAX_TOKENS: u32 = 2048;
+pub const CLASSIFY_SYSTEM: &str = "Eres un catalogador de pegatinas para una biblioteca \
+personal. Clasificas cada sticker por la obra a la que pertenece (serie) y por su familia (tipo). \
+Respondes solo con JSON válido.";
+
+/// One sticker as the classifier sees it: text only, never the artwork.
+pub struct ClassifyInput {
+    pub id: String,
+    pub name: String,
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Classification {
+    pub id: String,
+    pub serie: String,
+    pub tipo: String,
+}
+
+/// The user content for one batch: the rules, the series that already exist
+/// (so the model reuses their names) and the list of stickers.
+pub fn classify_content(series: &[String], batch: &[ClassifyInput]) -> serde_json::Value {
+    let mut text = String::from("Clasifica estos stickers.\n\n");
+    if !series.is_empty() {
+        text.push_str("Series que ya existen en la biblioteca; si el sticker encaja con una, \
+usa ese nombre EXACTAMENTE:\n");
+        for serie in series {
+            text.push_str("- ");
+            text.push_str(serie);
+            text.push('\n');
+        }
+        text.push('\n');
+    }
+    text.push_str(&format!(
+        "serie: la obra o franquicia (película, serie, anime, videojuego, cómic), con su forma \
+más conocida y en español cuando exista. Cadena vacía si no la reconoces con seguridad; no la \
+inventes.\ntipo: exactamente uno de: {}.\n\nStickers:\n",
+        TIPOS.join(", ")
+    ));
+    for (index, item) in batch.iter().enumerate() {
+        text.push_str(&format!(
+            "{}. id={} | nombre: {} | etiquetas: {}\n",
+            index + 1,
+            item.id,
+            item.name,
+            item.tags.join(", ")
+        ));
+    }
+    text.push_str(
+        "\nDevuelve SOLO este JSON: {\"items\":[{\"id\":\"...\",\"serie\":\"...\",\"tipo\":\"...\"}]}",
+    );
+    serde_json::json!([{ "type": "text", "text": text }])
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct WireItem {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    serie: String,
+    #[serde(default)]
+    tipo: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct WireAnswer {
+    #[serde(default)]
+    items: Vec<WireItem>,
+}
+
+/// Keeps only the stickers that were in the batch, first answer wins, and runs
+/// every field through the same cleaning as the vision answers.
+pub fn parse_classifications(
+    raw: &str,
+    wanted: &[String],
+) -> Result<Vec<Classification>, String> {
+    let trimmed = raw.trim();
+    let start = trimmed
+        .find('{')
+        .ok_or_else(|| "La IA no devolvió JSON".to_string())?;
+    let end = trimmed
+        .rfind('}')
+        .ok_or_else(|| "La IA no devolvió JSON".to_string())?;
+    if end <= start {
+        return Err("La IA no devolvió JSON".to_string());
+    }
+    let wire: WireAnswer = serde_json::from_str(&trimmed[start..=end])
+        .map_err(|e| format!("Respuesta ilegible de la IA: {e}"))?;
+
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for item in wire.items {
+        if !wanted.iter().any(|id| id == &item.id) || !seen.insert(item.id.clone()) {
+            continue;
+        }
+        out.push(Classification {
+            serie: clean_serie(&item.serie).unwrap_or_default(),
+            tipo: clean_tipo(&item.tipo),
+            id: item.id,
+        });
+    }
+    Ok(out)
 }
 
 /// One cheap request (a single token, no image) to tell whether a key works.
@@ -514,6 +663,73 @@ pub fn clean_name(raw: &str) -> Option<String> {
     Some(short.trim().to_string())
 }
 
+/// Lowercase without diacritics, so «Animación» and «animacion» are the same.
+fn fold(value: &str) -> String {
+    let plain: String = value
+        .to_lowercase()
+        .chars()
+        .map(|c| match c {
+            'á' | 'à' | 'ä' | 'â' => 'a',
+            'é' | 'è' | 'ë' | 'ê' => 'e',
+            'í' | 'ì' | 'ï' | 'î' => 'i',
+            'ó' | 'ò' | 'ö' | 'ô' => 'o',
+            'ú' | 'ù' | 'ü' | 'û' => 'u',
+            'ñ' => 'n',
+            other => other,
+        })
+        .collect();
+    plain.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The series is a plain canonical name: no quotes, no stray spaces, no control
+/// characters, and `None` when the model had nothing to say.
+pub fn clean_serie(raw: &str) -> Option<String> {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let cleaned = cleaned
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_matches(|c| c == '"' || c == '\'' || c == '«' || c == '»')
+        .trim()
+        .to_string();
+    if cleaned.is_empty() {
+        return None;
+    }
+    Some(cleaned.chars().take(MAX_SERIE_CHARS).collect::<String>().trim().to_string())
+}
+
+/// Reads the model's word for the family and fits it into `TIPOS`. Empty stays
+/// empty (the sticker can be classified later); anything unknown becomes `otros`.
+pub fn clean_tipo(raw: &str) -> String {
+    let folded = fold(raw);
+    if folded.is_empty() {
+        return String::new();
+    }
+    let known = match folded.as_str() {
+        "anime" | "animacion japonesa" | "manga" => "anime",
+        "comic" | "comics" | "tebeo" | "superheroes" => "comic",
+        "cartoon" | "dibujos animados" | "animacion" => "cartoon",
+        "videojuego" | "videojuegos" | "juego" => "videojuego",
+        "cine" | "pelicula" | "live action" | "accion real" => "cine",
+        "terror" | "horror" | "gotico" => "terror",
+        "fantasia" | "mitologia" => "fantasia",
+        "kawaii" | "chibi" | "monoso" => "kawaii",
+        "cotidiano" | "objeto" | "comida" | "animales" => "cotidiano",
+        "frase" | "tipografia" | "lettering" | "texto" => "frase",
+        "otros" => "otros",
+        _ => return "otros".to_string(),
+    };
+    // `TIPOS` is the single source of truth; the aliases above must land on it.
+    if TIPOS.contains(&known) {
+        known.to_string()
+    } else {
+        "otros".to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -535,9 +751,82 @@ mod tests {
             "Claro:\n```json\n{\"name\": \"Hello Kitty\", \"tags\": [\"kitty\"]}\n```",
         )
         .unwrap();
+        assert!(fenced.serie.is_empty() && fenced.tipo.is_empty());
         assert_eq!(fenced.name, "Hello Kitty");
 
         assert!(parse_answer("no tengo ni idea").is_none());
+    }
+
+    fn batch() -> Vec<ClassifyInput> {
+        vec![
+            ClassifyInput {
+                id: "a".into(),
+                name: "Pikachu".into(),
+                tags: vec!["amarillo".into()],
+            },
+            ClassifyInput {
+                id: "b".into(),
+                name: "Mandala".into(),
+                tags: vec!["flores".into()],
+            },
+        ]
+    }
+
+    #[test]
+    fn the_batch_prompt_carries_the_rules_and_the_stickers() {
+        let content = classify_content(&["Pokémon".into()], &batch());
+        let text = content[0]["text"].as_str().unwrap();
+        assert!(text.contains("Pokémon"), "falta la serie conocida");
+        for tipo in TIPOS {
+            assert!(text.contains(tipo), "el lote no menciona «{tipo}»");
+        }
+        assert!(text.contains("id=a") && text.contains("Pikachu"));
+        assert!(text.contains("id=b") && text.contains("Mandala"));
+    }
+
+    #[test]
+    fn classifications_keep_only_known_ids_and_clean_fields() {
+        let raw = "```json\n{\"items\":[\n  {\"id\":\"a\",\"serie\":\" «Pokémon» \",\"tipo\":\"Animación\"},\n  {\"id\":\"b\",\"serie\":\"\",\"tipo\":\"steampunk\"},\n  {\"id\":\"zz\",\"serie\":\"Otro\",\"tipo\":\"anime\"},\n  {\"id\":\"a\",\"serie\":\"Duplicado\",\"tipo\":\"cine\"}\n]}\n```";
+        let wanted = vec!["a".to_string(), "b".to_string()];
+        let items = parse_classifications(raw, &wanted).unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].serie, "Pokémon");
+        assert_eq!(items[0].tipo, "cartoon");
+        assert_eq!(items[1].serie, "");
+        assert_eq!(items[1].tipo, "otros");
+    }
+
+    #[test]
+    fn a_broken_batch_answer_is_an_error_not_a_panic() {
+        assert!(parse_classifications("lo siento", &[]).is_err());
+        assert!(parse_classifications("{", &[]).is_err());
+        assert_eq!(parse_classifications("{\"items\":[]}", &[]).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn the_prompt_offers_every_known_tipo() {
+        for tipo in TIPOS {
+            assert!(PROMPT.contains(tipo), "el prompt no menciona «{tipo}»");
+        }
+    }
+
+    #[test]
+    fn tipos_are_folded_into_the_closed_list() {
+        assert_eq!(clean_tipo("Animación"), "cartoon");
+        assert_eq!(clean_tipo("  ANIME "), "anime");
+        assert_eq!(clean_tipo("horror"), "terror");
+        assert_eq!(clean_tipo("Kawaii"), "kawaii");
+        assert_eq!(clean_tipo("steampunk"), "otros");
+        assert_eq!(clean_tipo(""), "");
+        assert_eq!(clean_tipo("   "), "");
+    }
+
+    #[test]
+    fn series_names_are_trimmed_and_never_empty_strings() {
+        assert_eq!(clean_serie("  «Pokémon»  ").unwrap(), "Pokémon");
+        assert_eq!(clean_serie("Looney   Tunes").unwrap(), "Looney Tunes");
+        assert_eq!(clean_serie("   "), None);
+        assert_eq!(clean_serie("\"\""), None);
     }
 
     #[test]

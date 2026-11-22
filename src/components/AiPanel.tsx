@@ -19,6 +19,10 @@ interface Props {
   onClose: () => void;
   /** Reloads the library once the run is over. */
   onUpdated: () => Promise<void> | void;
+  /** Stickers the text classifier has not looked at yet. */
+  unclassified: number;
+  /** Runs the text-only classification and reports back through a toast. */
+  onClassify: () => Promise<void>;
 }
 
 interface KeyRowProps {
@@ -120,7 +124,15 @@ function KeyRow({
   );
 }
 
-export function AiPanel({ open, pending, total, onClose, onUpdated }: Props) {
+export function AiPanel({
+  open,
+  pending,
+  total,
+  onClose,
+  onUpdated,
+  unclassified,
+  onClassify,
+}: Props) {
   const { t } = useI18n();
   const [status, setStatus] = useState<AiStatus | null>(null);
   const [nameInput, setNameInput] = useState("");
@@ -131,6 +143,7 @@ export function AiPanel({ open, pending, total, onClose, onUpdated }: Props) {
   const [checks, setChecks] = useState<Record<string, AiKeyCheck>>({});
   const [testingId, setTestingId] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
+  const [classifying, setClassifying] = useState(false);
   const [done, setDone] = useState(0);
   const [goal, setGoal] = useState(0);
   const [failures, setFailures] = useState<AiFailure[]>([]);
@@ -159,20 +172,31 @@ export function AiPanel({ open, pending, total, onClose, onUpdated }: Props) {
     };
   }, [open]);
 
+  // Esc closes the dialog, like the ✕: not while a batch is halfway through.
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key !== "Escape" || running || classifying) return;
+      onClose();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [open, onClose]);
+  }, [open, running, classifying, onClose]);
 
   if (!open) return null;
 
   const keys = status?.keys ?? [];
   const configured = keys.length > 0;
-  const locked = running || adding || busyKey;
+  const locked = running || classifying || adding || busyKey;
+
+  const classify = async () => {
+    setClassifying(true);
+    try {
+      await onClassify();
+    } finally {
+      setClassifying(false);
+    }
+  };
 
   const applyStatus = (next: AiStatus) => {
     setStatus(next);
@@ -298,7 +322,7 @@ export function AiPanel({ open, pending, total, onClose, onUpdated }: Props) {
     <div
       className="ai-backdrop"
       onPointerDown={(e) => {
-        if (e.target === e.currentTarget && !running) onClose();
+        if (e.target === e.currentTarget && !running && !classifying) onClose();
       }}
     >
       <div className="ai-panel" role="dialog" aria-modal="true" aria-label={t("ai.title")}>
@@ -317,7 +341,8 @@ export function AiPanel({ open, pending, total, onClose, onUpdated }: Props) {
           </button>
         </header>
 
-        <section className="ai-field">
+        <div className="ai-body">
+          <section className="ai-field">
           <div className="ai-field-head">
             <span className="field-label">
               {t("ai.keysTitle")} · {keys.length}
@@ -381,8 +406,53 @@ export function AiPanel({ open, pending, total, onClose, onUpdated }: Props) {
             </button>
           </div>
 
-          {keyError && <span className="err">{keyError}</span>}
-        </section>
+            {keyError && <span className="err">{keyError}</span>}
+          </section>
+
+          {(running || summary) && (
+            <section className="ai-progress-box">
+              <div className="ai-progress" role="progressbar" aria-valuemin={0} aria-valuemax={goal} aria-valuenow={done}>
+                <span style={{ width: `${goal ? Math.round((done / goal) * 100) : 0}%` }} />
+              </div>
+              <span className="muted small">
+                {running
+                  ? t("ai.running", { done, n: goal })
+                  : summary?.cancelled
+                    ? t("ai.cancelled", { n: done })
+                    : t("ai.done", { n: summary?.updated ?? 0 })}
+              </span>
+              {!running && (summary?.failed ?? 0) > 0 && (
+                <span className="err small">{t("ai.failed", { n: summary?.failed ?? 0 })}</span>
+              )}
+              {failures.length > 0 && (
+                <ul className="ai-errors">
+                  {failures.slice(0, 4).map((failure, index) => (
+                    <li key={`${failure.id}-${index}`}>{failure.message}</li>
+                  ))}
+                </ul>
+              )}
+            </section>
+          )}
+
+          <section className="ai-field">
+            <div className="ai-field-head">
+              <span className="field-label">{t("ai.classifyTitle")}</span>
+            </div>
+            <span className="muted small">{t("ai.classifyNote")}</span>
+            <button
+              className="ghost-btn"
+              onClick={() => void classify()}
+              disabled={locked || classifying || unclassified === 0}
+              title={configured ? undefined : t("ai.needKey")}
+            >
+              {classifying
+                ? t("ai.classifying")
+                : unclassified === 0
+                  ? t("ai.classifyNone")
+                  : t("ai.classify", { n: unclassified })}
+            </button>
+          </section>
+        </div>
 
         <section className="ai-run">
           <div>
@@ -408,31 +478,6 @@ export function AiPanel({ open, pending, total, onClose, onUpdated }: Props) {
             </button>
           )}
         </section>
-
-        {(running || summary) && (
-          <section className="ai-progress-box">
-            <div className="ai-progress" role="progressbar" aria-valuemin={0} aria-valuemax={goal} aria-valuenow={done}>
-              <span style={{ width: `${goal ? Math.round((done / goal) * 100) : 0}%` }} />
-            </div>
-            <span className="muted small">
-              {running
-                ? t("ai.running", { done, n: goal })
-                : summary?.cancelled
-                  ? t("ai.cancelled", { n: done })
-                  : t("ai.done", { n: summary?.updated ?? 0 })}
-            </span>
-            {!running && (summary?.failed ?? 0) > 0 && (
-              <span className="err small">{t("ai.failed", { n: summary?.failed ?? 0 })}</span>
-            )}
-            {failures.length > 0 && (
-              <ul className="ai-errors">
-                {failures.slice(0, 4).map((failure, index) => (
-                  <li key={`${failure.id}-${index}`}>{failure.message}</li>
-                ))}
-              </ul>
-            )}
-          </section>
-        )}
       </div>
     </div>
   );
