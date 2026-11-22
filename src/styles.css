@@ -1228,6 +1228,18 @@ button {
   box-shadow: inset 0 0 0 1px var(--accent);
 }
 
+/* The app's own yes/no question, drawn above everything else. */
+.ask-panel {
+  width: min(440px, 100%);
+  gap: 16px;
+}
+
+.ask-text {
+  margin: 0;
+  font-size: 13.5px;
+  line-height: 1.5;
+}
+
 /* Sheets kept inside the app. */
 .sheets-panel {
   width: min(520px, 100%);

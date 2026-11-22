@@ -4,7 +4,6 @@ import {
   PROJECT_EXTENSION,
   aiClassify,
   aiDescribe,
-  askConfirm,
   deleteStickers,
   exportLibraryArchive,
   importLibraryArchive,
@@ -93,6 +92,11 @@ export default function App() {
   const [sheetId, setSheetId] = useState<string | null>(null);
   const [sheetName, setSheetName] = useState("");
   const [sheetsPanel, setSheetsPanel] = useState<"open" | "save" | null>(null);
+  // A question drawn by the app itself: the webview's own confirm returns
+  // before the user answers, which let actions run without a yes.
+  const [ask, setAsk] = useState<{ message: string; resolve: (value: boolean) => void } | null>(
+    null,
+  );
   const [sheetsBusy, setSheetsBusy] = useState(false);
   const [aiOpen, setAiOpen] = useState(false);
   const [seriesOpen, setSeriesOpen] = useState(false);
@@ -173,6 +177,32 @@ export default function App() {
     const id = window.setTimeout(() => setToast(null), 4200);
     return () => window.clearTimeout(id);
   }, [toast]);
+
+  const confirmAction = useCallback(
+    (message: string) => new Promise<boolean>((resolve) => setAsk({ message, resolve })),
+    [],
+  );
+
+  const answerConfirm = useCallback(
+    (value: boolean) => {
+      const current = ask;
+      if (!current) return;
+      current.resolve(value);
+      setAsk(null);
+    },
+    [ask],
+  );
+
+  useEffect(() => {
+    if (!ask) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      answerConfirm(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [ask, answerConfirm]);
 
   const runImport = useCallback(
     async (paths: string[]) => {
@@ -460,7 +490,7 @@ export default function App() {
   const removeSelection = useCallback(
     async (ids: string[]) => {
       if (!ids.length) return;
-      const ok = await askConfirm(t("detail.deleteConfirm", { n: ids.length }));
+      const ok = await confirmAction(t("detail.deleteConfirm", { n: ids.length }));
       if (!ok) return;
       try {
         await deleteStickers(ids);
@@ -595,7 +625,7 @@ export default function App() {
   // after the user agrees, so a restore or an open never loses work silently.
   const loadProject = useCallback(
     async (path: string, announce: boolean) => {
-      if (sheetCopies.length > 0 && !(await askConfirm(t("sheet.openConfirm")))) return;
+      if (sheetCopies.length > 0 && !(await confirmAction(t("sheet.openConfirm")))) return;
       const project = await openSheetProject(path);
       const copies = await withLibraryNames(project.copies);
       setSheetId(null);
@@ -652,7 +682,7 @@ export default function App() {
 
   const openLocalSheet = useCallback(
     async (sheet: SavedSheet) => {
-      if (sheetCopies.length > 0 && !(await askConfirm(t("sheet.openConfirm")))) return;
+      if (sheetCopies.length > 0 && !(await confirmAction(t("sheet.openConfirm")))) return;
       setSheetsBusy(true);
       try {
         const project = await openSavedSheet(sheet.id);
@@ -678,7 +708,7 @@ export default function App() {
 
   const removeLocalSheet = useCallback(
     async (sheet: SavedSheet) => {
-      if (!(await askConfirm(t("sheet.sheetsDeleteConfirm", { name: sheet.name })))) return;
+      if (!(await confirmAction(t("sheet.sheetsDeleteConfirm", { name: sheet.name })))) return;
       setSheetsBusy(true);
       try {
         await deleteSavedSheet(sheet.id);
@@ -792,6 +822,7 @@ export default function App() {
             onDuplicate={duplicateCopy}
             onRotate={spinCopy}
             sheetName={sheetName}
+            onConfirm={confirmAction}
             onSaveLocal={beginSaveLocal}
             onOpenSheets={() => {
               setSheetsPanel("open");
@@ -989,6 +1020,30 @@ export default function App() {
           await refreshPending();
         }}
       />
+
+      {ask && (
+        <div className="picker-backdrop" onPointerDown={() => answerConfirm(false)}>
+          <div
+            className="picker ask-panel"
+            role="alertdialog"
+            aria-modal="true"
+            onPointerDown={(event) => event.stopPropagation()}
+          >
+            <p className="ask-text">{ask.message}</p>
+            <footer className="picker-foot">
+              <span />
+              <div className="archive-actions">
+                <button className="ghost-btn" autoFocus onClick={() => answerConfirm(false)}>
+                  {t("common.cancel")}
+                </button>
+                <button className="primary-btn" onClick={() => answerConfirm(true)}>
+                  {t("common.yes")}
+                </button>
+              </div>
+            </footer>
+          </div>
+        </div>
+      )}
 
       {toast && <div className={`toast ${toast.kind}`}>{toast.text}</div>}
     </div>
