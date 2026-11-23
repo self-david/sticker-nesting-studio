@@ -24,6 +24,7 @@ import {
   listSavedSheets,
   openSavedSheet,
   openSheetProject,
+  renameSavedSheet,
   saveSavedSheet,
   type SavedSheet,
   pickImages,
@@ -40,13 +41,22 @@ import {
 import { useI18n } from "./lib/i18n";
 import { filterStickers, parseQuery } from "./lib/search";
 import { groupStickers, visualOrder, type GroupBy } from "./lib/group";
-import { forgetLastSheet, lastSheet, rememberLastSheet } from "./lib/recent";
+import {
+  forgetLastLocalSheet,
+  forgetLastSheet,
+  lastLocalSheet,
+  lastSheet,
+  rememberLastLocalSheet,
+  rememberLastSheet,
+} from "./lib/recent";
 import {
   DEFAULT_SETTINGS,
   copiesFromSticker,
   newId,
+  resizeCopiesToArea,
   resizeCopy,
   rotateCopy,
+  sheetFileName,
   type SheetCopy,
   type SheetSettings,
 } from "./lib/sheet";
@@ -55,6 +65,7 @@ import { StickerGrid } from "./components/StickerGrid";
 import { DetailPanel } from "./components/DetailPanel";
 import { SheetView } from "./components/SheetView";
 import { SavedSheetsPanel } from "./components/SavedSheetsPanel";
+import { ConfirmDialog } from "./components/ConfirmDialog";
 import { AiPanel } from "./components/AiPanel";
 import { SeriesPanel } from "./components/SeriesPanel";
 import { LibraryArchivePanel } from "./components/LibraryArchivePanel";
@@ -63,6 +74,12 @@ import { BulkClassification } from "./components/BulkClassification";
 interface Toast {
   kind: "ok" | "err";
   text: string;
+}
+
+interface CopySize {
+  id: string;
+  widthMm: number;
+  heightMm: number;
 }
 
 export default function App() {
@@ -85,6 +102,9 @@ export default function App() {
   const [dropping, setDropping] = useState(false);
   const [toast, setToast] = useState<Toast | null>(null);
   const [sheetCopies, setSheetCopies] = useState<SheetCopy[]>([]);
+  // Sizes each copy had before the last bulk area change, so one click can
+  // put them back.
+  const [areaUndo, setAreaUndo] = useState<CopySize[] | null>(null);
   const [sheetSettings, setSheetSettings] = useState<SheetSettings>(DEFAULT_SETTINGS);
   // Sheets kept in the library: the id is set once saved, so saving again
   // rewrites the same one instead of piling up copies.
@@ -185,24 +205,11 @@ export default function App() {
 
   const answerConfirm = useCallback(
     (value: boolean) => {
-      const current = ask;
-      if (!current) return;
-      current.resolve(value);
+      ask?.resolve(value);
       setAsk(null);
     },
     [ask],
   );
-
-  useEffect(() => {
-    if (!ask) return;
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") return;
-      event.preventDefault();
-      answerConfirm(false);
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [ask, answerConfirm]);
 
   const runImport = useCallback(
     async (paths: string[]) => {
@@ -519,18 +526,20 @@ export default function App() {
     (quantity: number) => {
       const chosen = stickers.filter((s) => selection.includes(s.id));
       if (!chosen.length) return;
-      const added = chosen.flatMap((sticker) => copiesFromSticker(sticker, quantity));
+      const added = chosen.flatMap((sticker) =>
+        copiesFromSticker(sticker, quantity, sheetSettings.areaCm2),
+      );
       setSheetCopies((prev) => [...prev, ...added]);
       setView("sheet");
     },
-    [selection, stickers],
+    [selection, sheetSettings.areaCm2, stickers],
   );
 
   // One entry point for adding: the library's quick button asks for one copy,
   // the sheet's picker asks for the quantity typed there.
   const addStickerCopies = useCallback(
     (sticker: Sticker, quantity: number) => {
-      const added = copiesFromSticker(sticker, quantity);
+      const added = copiesFromSticker(sticker, quantity, sheetSettings.areaCm2);
       const total = sheetCopies.length + added.length;
       setSheetCopies((prev) => [...prev, ...added]);
       setToast({
@@ -541,7 +550,7 @@ export default function App() {
             : t("sheet.addedMany", { n: added.length, name: sticker.name, total }),
       });
     },
-    [sheetCopies.length, t],
+    [sheetCopies.length, sheetSettings.areaCm2, t],
   );
 
   // Editing either dimension keeps the sticker's original proportions.
@@ -553,6 +562,38 @@ export default function App() {
     },
     [],
   );
+
+  // Evens out what is already on the sheet, so every piece ends up the same
+  // size as the one a new sticker would get. The previous sizes are kept once.
+  const applyAreaToCopies = useCallback(() => {
+    const area = sheetSettings.areaCm2;
+    if (!(area > 0) || sheetCopies.length === 0) return;
+    setAreaUndo(
+      sheetCopies.map((copy) => ({
+        id: copy.id,
+        widthMm: copy.widthMm,
+        heightMm: copy.heightMm,
+      })),
+    );
+    setSheetCopies((prev) => resizeCopiesToArea(prev, area));
+    setToast({ kind: "ok", text: t("sheet.areaApplied", { n: sheetCopies.length, area }) });
+  }, [sheetCopies, sheetSettings.areaCm2, t]);
+
+  // Only the sizes go back: copies added or removed since keep their place.
+  const undoArea = useCallback(() => {
+    if (!areaUndo) return;
+    const before = new Map(areaUndo.map((size) => [size.id, size]));
+    setSheetCopies((prev) =>
+      prev.map((copy) => {
+        const size = before.get(copy.id);
+        return size
+          ? { ...copy, widthMm: size.widthMm, heightMm: size.heightMm }
+          : copy;
+      }),
+    );
+    setAreaUndo(null);
+    setToast({ kind: "ok", text: t("sheet.areaUndone") });
+  }, [areaUndo, t]);
 
   const duplicateCopy = useCallback((id: string) => {
     setSheetCopies((prev) => {
@@ -581,7 +622,7 @@ export default function App() {
     try {
       const destination = await pickProjectFile(
         t("sheet.saveProjectTitle"),
-        `hoja-stickers.${PROJECT_EXTENSION}`,
+        sheetFileName(sheetName, "hoja-stickers", PROJECT_EXTENSION),
       );
       if (!destination) return;
       const saved = await saveSheetProject(destination, sheetSettings, sheetCopies);
@@ -590,7 +631,7 @@ export default function App() {
     } catch (err) {
       setToast({ kind: "err", text: String(err) });
     }
-  }, [sheetCopies, sheetSettings, t]);
+  }, [sheetCopies, sheetSettings, sheetName, t]);
 
   const refreshSheets = useCallback(async () => {
     if (!isTauri) return;
@@ -630,6 +671,7 @@ export default function App() {
       const copies = await withLibraryNames(project.copies);
       setSheetId(null);
       setSheetName("");
+      setAreaUndo(null);
       setSheetCopies(copies);
       setSheetSettings(project.settings);
       setView("sheet");
@@ -658,6 +700,7 @@ export default function App() {
         const saved = await saveSavedSheet(sheetId, name, sheetSettings, sheetCopies);
         setSheetId(saved.id);
         setSheetName(saved.name);
+        rememberLastLocalSheet(saved.id);
         setSheetsPanel(null);
         await refreshSheets();
         setToast({ kind: "ok", text: t("sheet.savedLocal", { name: saved.name }) });
@@ -687,10 +730,12 @@ export default function App() {
       try {
         const project = await openSavedSheet(sheet.id);
         const copies = await withLibraryNames(project.copies);
+        setAreaUndo(null);
         setSheetCopies(copies);
         setSheetSettings(project.settings);
         setSheetId(sheet.id);
         setSheetName(sheet.name);
+        rememberLastLocalSheet(sheet.id);
         setSheetsPanel(null);
         setView("sheet");
         setToast({
@@ -706,6 +751,36 @@ export default function App() {
     [sheetCopies.length, t, withLibraryNames],
   );
 
+  // Renaming touches the name only: the layout inside keeps its place.
+  const renameLocalSheet = useCallback(
+    async (sheet: SavedSheet, name: string) => {
+      const clean = name.trim();
+      if (!clean || clean === sheet.name) return;
+      try {
+        const renamed = await renameSavedSheet(sheet.id, clean);
+        if (sheetId === renamed.id) setSheetName(renamed.name);
+        await refreshSheets();
+        setToast({ kind: "ok", text: t("sheet.renamed", { name: renamed.name }) });
+      } catch (err) {
+        setToast({ kind: "err", text: String(err) });
+      }
+    },
+    [refreshSheets, sheetId, t],
+  );
+
+  // A new sheet: an empty workspace with no name yet, saved when asked.
+  const newLocalSheet = useCallback(async () => {
+    if (sheetCopies.length > 0 && !(await confirmAction(t("sheet.newSheetConfirm")))) return;
+    setSheetCopies([]);
+    setAreaUndo(null);
+    setSheetId(null);
+    setSheetName("");
+    forgetLastLocalSheet();
+    setSheetsPanel(null);
+    setView("sheet");
+    setToast({ kind: "ok", text: t("sheet.newSheetDone") });
+  }, [confirmAction, sheetCopies.length, t]);
+
   const removeLocalSheet = useCallback(
     async (sheet: SavedSheet) => {
       if (!(await confirmAction(t("sheet.sheetsDeleteConfirm", { name: sheet.name })))) return;
@@ -716,6 +791,7 @@ export default function App() {
           setSheetId(null);
           setSheetName("");
         }
+        if (lastLocalSheet() === sheet.id) forgetLastLocalSheet();
         await refreshSheets();
         setToast({ kind: "ok", text: t("sheet.sheetDeleted", { name: sheet.name }) });
       } catch (err) {
@@ -744,14 +820,36 @@ export default function App() {
     [loadProject, t],
   );
 
-  // Reopens the sheet from the last session as soon as the app starts.
+  // Reopens the sheet from the last session as soon as the app starts: the one
+  // saved inside the app or a `.sns` file, whichever was used last.
   const restoredRef = useRef(false);
   useEffect(() => {
     if (!isTauri || restoredRef.current) return;
     restoredRef.current = true;
+    const localId = lastLocalSheet();
     const path = lastSheet();
-    if (!path) return;
+    if (!localId && !path) return;
     void (async () => {
+      if (localId) {
+        try {
+          const project = await openSavedSheet(localId);
+          const sheets = await listSavedSheets();
+          const sheet = sheets.find((item) => item.id === localId);
+          if (!sheet) throw new Error("La hoja ya no está guardada");
+          setSavedSheets(sheets);
+          setAreaUndo(null);
+          setSheetCopies(await withLibraryNames(project.copies));
+          setSheetSettings(project.settings);
+          setSheetId(sheet.id);
+          setSheetName(sheet.name);
+          setView("sheet");
+          return;
+        } catch {
+          // Deleted or unreadable: fall back to a `.sns` from before, if any.
+          forgetLastLocalSheet();
+        }
+      }
+      if (!path) return;
       try {
         await loadProject(path, false);
       } catch {
@@ -761,10 +859,12 @@ export default function App() {
         setToast({ kind: "err", text: t("sheet.restoreFailed", { path }) });
       }
     })();
-  }, [loadProject, t]);
+  }, [loadProject, t, withLibraryNames]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      // While a question is open, Escape belongs to it.
+      if (ask) return;
       const target = e.target as HTMLElement | null;
       if (target && /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName)) return;
       if (e.key === "Escape") setSelection([]);
@@ -774,7 +874,7 @@ export default function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [selection, removeSelection, view]);
+  }, [ask, selection, removeSelection, view]);
 
   const filtering =
     parsed.active || activeTags.length > 0 || activeSerie !== null || activeTipo !== null;
@@ -821,6 +921,9 @@ export default function App() {
             onUpdateCopy={updateCopy}
             onDuplicate={duplicateCopy}
             onRotate={spinCopy}
+            onApplyArea={applyAreaToCopies}
+            onUndoArea={undoArea}
+            canUndoArea={areaUndo !== null}
             sheetName={sheetName}
             onConfirm={confirmAction}
             onSaveLocal={beginSaveLocal}
@@ -986,6 +1089,8 @@ export default function App() {
           onSave={(name) => void saveLocalSheet(name)}
           onOpen={(sheet) => void openLocalSheet(sheet)}
           onDelete={(sheet) => void removeLocalSheet(sheet)}
+          onRename={(sheet, name) => void renameLocalSheet(sheet, name)}
+          onNew={() => void newLocalSheet()}
         />
       )}
 
@@ -1021,29 +1126,7 @@ export default function App() {
         }}
       />
 
-      {ask && (
-        <div className="picker-backdrop" onPointerDown={() => answerConfirm(false)}>
-          <div
-            className="picker ask-panel"
-            role="alertdialog"
-            aria-modal="true"
-            onPointerDown={(event) => event.stopPropagation()}
-          >
-            <p className="ask-text">{ask.message}</p>
-            <footer className="picker-foot">
-              <span />
-              <div className="archive-actions">
-                <button className="ghost-btn" autoFocus onClick={() => answerConfirm(false)}>
-                  {t("common.cancel")}
-                </button>
-                <button className="primary-btn" onClick={() => answerConfirm(true)}>
-                  {t("common.yes")}
-                </button>
-              </div>
-            </footer>
-          </div>
-        </div>
-      )}
+      {ask && <ConfirmDialog message={ask.message} onAnswer={answerConfirm} />}
 
       {toast && <div className={`toast ${toast.kind}`}>{toast.text}</div>}
     </div>

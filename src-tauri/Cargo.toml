@@ -1,6 +1,6 @@
 [package]
 name = "stickers-print"
-version = "0.1.0"
+version = "0.2.0"
 description = "Sticker Nesting Studio"
 authors = ["you"]
 edition = "2021"

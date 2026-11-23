@@ -329,7 +329,7 @@ pub fn client() -> Result<reqwest::Client, String> {
 /// The artwork flattened onto white and re-encoded as JPEG: the models read it
 /// more reliably than a transparent PNG, and it keeps the request small.
 fn data_url(path: &Path) -> Result<String, String> {
-    let (rgba, width, height) = crate::contour::load_rgba(path)?;
+    let (rgba, width, height) = crate::contour::load_rgba(path, crate::contour::MAX_SIDE)?;
     let img = image::RgbaImage::from_raw(width, height, rgba)
         .ok_or_else(|| "No se pudo preparar la vista previa".to_string())?;
     let mut flat = image::RgbImage::new(width, height);

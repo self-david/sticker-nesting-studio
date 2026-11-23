@@ -762,6 +762,31 @@ pub fn open_sheet(conn: &Connection, id: &str) -> Result<String, String> {
         .ok_or_else(|| "Esa hoja ya no está guardada en la app".to_string())
 }
 
+/// Changes only the name: the layout saved inside stays as it is.
+pub fn rename_sheet(conn: &Connection, id: &str, name: &str) -> Result<SavedSheet, String> {
+    let name = sheet_name(name);
+    let changed = conn
+        .execute("UPDATE sheets SET name = ?1 WHERE id = ?2", params![name, id])
+        .map_err(|e| e.to_string())?;
+    if changed == 0 {
+        return Err("Esa hoja ya no está guardada en la app".into());
+    }
+    conn.query_row(
+        "SELECT updated_at, payload FROM sheets WHERE id = ?1",
+        [id],
+        |r| {
+            let payload: String = r.get(1)?;
+            Ok(SavedSheet {
+                id: id.to_string(),
+                name: name.clone(),
+                updated_at: r.get(0)?,
+                copies: copy_count(&payload),
+            })
+        },
+    )
+    .map_err(|e| e.to_string())
+}
+
 pub fn delete_sheet(conn: &Connection, id: &str) -> Result<usize, String> {
     conn.execute("DELETE FROM sheets WHERE id = ?1", [id])
         .map_err(|e| e.to_string())
@@ -957,6 +982,12 @@ mod tests {
         let unnamed = save_sheet(&conn, None, "   ", payload).unwrap();
         assert_eq!(unnamed.name, "Hoja");
         assert_eq!(list_sheets(&conn).unwrap().len(), 2);
+
+        let renamed = rename_sheet(&conn, &first.id, "  Otro nombre  ").unwrap();
+        assert_eq!(renamed.name, "Otro nombre");
+        assert_eq!(renamed.copies, 2);
+        assert_eq!(open_sheet(&conn, &first.id).unwrap(), payload);
+        assert!(rename_sheet(&conn, "no-existe", "X").is_err());
 
         assert_eq!(delete_sheet(&conn, &first.id).unwrap(), 1);
         assert!(open_sheet(&conn, &first.id).is_err());

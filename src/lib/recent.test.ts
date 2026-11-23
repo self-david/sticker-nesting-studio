@@ -1,5 +1,12 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { forgetLastSheet, lastSheet, rememberLastSheet } from "./recent";
+import {
+  forgetLastLocalSheet,
+  forgetLastSheet,
+  lastLocalSheet,
+  lastSheet,
+  rememberLastLocalSheet,
+  rememberLastSheet,
+} from "./recent";
 
 const store = new Map<string, string>();
 
@@ -53,5 +60,20 @@ describe("last sheet", () => {
     expect(() => rememberLastSheet("C:/hojas/hoja.sns")).not.toThrow();
     expect(() => forgetLastSheet()).not.toThrow();
     expect(lastSheet()).toBeNull();
+  });
+
+  test("a sheet saved in the app is remembered instead of the file", () => {
+    rememberLastSheet("C:/hojas/hoja.sns");
+    rememberLastLocalSheet("id-123");
+    expect(lastLocalSheet()).toBe("id-123");
+    expect(lastSheet()).toBeNull();
+
+    // And opening a file again takes the place back.
+    rememberLastSheet("C:/hojas/otra.sns");
+    expect(lastSheet()).toBe("C:/hojas/otra.sns");
+    expect(lastLocalSheet()).toBeNull();
+
+    forgetLastLocalSheet();
+    expect(lastLocalSheet()).toBeNull();
   });
 });

@@ -12,6 +12,8 @@ interface Props {
   onSave: (name: string) => void;
   onOpen: (sheet: SavedSheet) => void;
   onDelete: (sheet: SavedSheet) => void;
+  onRename: (sheet: SavedSheet, name: string) => void;
+  onNew: () => void;
 }
 
 /**
@@ -27,9 +29,13 @@ export function SavedSheetsPanel({
   onSave,
   onOpen,
   onDelete,
+  onRename,
+  onNew,
 }: Props) {
   const { t, locale } = useI18n();
   const [name, setName] = useState(defaultName);
+  const [editing, setEditing] = useState<string | null>(null);
+  const [draft, setDraft] = useState("");
 
   const when = (ms: number) =>
     new Date(ms).toLocaleString(locale === "es" ? "es-ES" : "en-GB", {
@@ -87,9 +93,28 @@ export function SavedSheetsPanel({
           {sheets.map((sheet) => (
             <div className="saved-sheet-row" key={sheet.id}>
               <div className="archive-names">
-                <span className="archive-name" title={sheet.name}>
-                  {sheet.name}
-                </span>
+                {editing === sheet.id ? (
+                  <input
+                    className="text-input mini"
+                    value={draft}
+                    autoFocus
+                    disabled={busy}
+                    aria-label={t("sheet.sheetName")}
+                    onChange={(event) => setDraft(event.target.value)}
+                    onBlur={() => {
+                      onRename(sheet, draft);
+                      setEditing(null);
+                    }}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") (event.target as HTMLInputElement).blur();
+                      if (event.key === "Escape") setEditing(null);
+                    }}
+                  />
+                ) : (
+                  <span className="archive-name" title={sheet.name}>
+                    {sheet.name}
+                  </span>
+                )}
                 <span className="archive-existing">
                   {t("sheet.sheetCopies", { n: sheet.copies })} · {when(sheet.updatedAt)}
                 </span>
@@ -99,6 +124,18 @@ export function SavedSheetsPanel({
                   {t("sheet.sheetOpen")}
                 </button>
               )}
+              <button
+                className="icon-btn"
+                onClick={() => {
+                  setDraft(sheet.name);
+                  setEditing(sheet.id);
+                }}
+                disabled={busy || editing === sheet.id}
+                title={t("sheet.rename")}
+                aria-label={`${t("sheet.rename")}: ${sheet.name}`}
+              >
+                ✎
+              </button>
               <button
                 className="icon-btn"
                 onClick={() => onDelete(sheet)}
@@ -113,9 +150,13 @@ export function SavedSheetsPanel({
         </div>
 
         <footer className="picker-foot">
-          <span className="muted small">
-            {busy ? t("sheet.sheetsSaving") : ""}
-          </span>
+          {mode === "open" ? (
+            <button className="link-btn" onClick={onNew} disabled={busy}>
+              + {t("sheet.newSheet")}
+            </button>
+          ) : (
+            <span className="muted small">{busy ? t("sheet.sheetsSaving") : ""}</span>
+          )}
           <div className="archive-actions">
             <button className="ghost-btn" onClick={onClose} disabled={busy}>
               {t("common.cancel")}

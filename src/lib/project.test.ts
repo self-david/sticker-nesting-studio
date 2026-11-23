@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { DEFAULT_SETTINGS, MIN_PAPER_MM, type SheetCopy } from "./sheet";
-import { hydrateProject, projectCopies, quarterTurn } from "./project";
+import { hydrateProject, normalizeAngle, projectCopies } from "./project";
 
 const copy = (id: string): SheetCopy => ({
   id,
@@ -96,9 +96,10 @@ describe("hydrateProject", () => {
   });
 
   test("rounds rotation to quarter turns", () => {
-    expect(quarterTurn(45)).toBe(0);
-    expect(quarterTurn(-90)).toBe(270);
-    expect(quarterTurn(450)).toBe(90);
-    expect(quarterTurn(Number.NaN)).toBe(0);
+    expect(normalizeAngle(45)).toBe(45);
+    expect(normalizeAngle(60)).toBe(45);
+    expect(normalizeAngle(-90)).toBe(270);
+    expect(normalizeAngle(450)).toBe(90);
+    expect(normalizeAngle(Number.NaN)).toBe(0);
   });
 });

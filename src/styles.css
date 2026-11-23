@@ -738,12 +738,11 @@ button {
   pointer-events: none;
 }
 
-/* Centred by margins instead of a grid: a copy laid out turned has an art box
-   that is taller than its footprint, and a grid would push it downwards. */
+/* Placed by its own offsets inside the footprint and turned around its
+   centre, so the art and its outline stay together at any angle. */
 .sheet-art {
   position: absolute;
-  inset: 0;
-  margin: auto;
+  transform-origin: center;
 }
 
 .sheet-outline {
@@ -1098,6 +1097,106 @@ button {
   gap: 4px;
 }
 
+/* The page number is typed as well as clicked, so a long sheet is reachable
+   without forty presses on the chevrons. */
+.sheet-page-jump {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--muted);
+}
+
+.page-jump {
+  width: 40px;
+  padding: 2px 4px;
+  text-align: center;
+  font-size: 12px;
+  border-radius: 6px;
+  background: var(--panel-2);
+  border: 1px solid var(--line-soft);
+  color: var(--text);
+}
+
+.page-jump:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.sheet-footer-right {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+/* Real size can be larger than the window: a block layout keeps the top-left
+   corner reachable, which centring with a grid does not. */
+.sheet-stage.is-real {
+  display: block;
+}
+
+.sheet-stage.is-real .sheet-page {
+  margin: 0 auto;
+}
+
+/* The ruler the screen is calibrated against. */
+.ruler-panel {
+  width: min(640px, 100%);
+}
+
+.ruler-track {
+  overflow-x: auto;
+  padding: 4px 2px;
+}
+
+.ruler-bar {
+  position: relative;
+  height: 46px;
+  border-bottom: 2px solid var(--text);
+  margin: 0 auto;
+}
+
+.ruler-tick {
+  position: absolute;
+  bottom: 0;
+  width: 1px;
+  height: 8px;
+  background: var(--muted);
+}
+
+.ruler-tick.is-cm {
+  height: 22px;
+  background: var(--text);
+}
+
+.ruler-tick em {
+  position: absolute;
+  left: -4px;
+  top: 24px;
+  font-size: 10px;
+  font-style: normal;
+  color: var(--muted);
+}
+
+.ruler-unit {
+  position: absolute;
+  right: -18px;
+  bottom: -2px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.ruler-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.ruler-slider {
+  width: 100%;
+  accent-color: var(--accent);
+}
+
 .sheet-panel {
   display: flex;
   flex-direction: column;
@@ -1240,6 +1339,10 @@ button {
   line-height: 1.5;
 }
 
+.ask-actions {
+  justify-content: flex-end;
+}
+
 /* Sheets kept inside the app. */
 .sheets-panel {
   width: min(520px, 100%);
@@ -1265,6 +1368,13 @@ button {
   height: 28px;
   padding: 0 12px;
   font-size: 12.5px;
+}
+
+/* Bulk area change and its single step back, side by side. */
+.area-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
 }
 
 .sheet-name-chip {

@@ -37,6 +37,9 @@ pub struct ProjectSettings {
     pub custom_width_mm: f64,
     #[serde(default = "default_page_h")]
     pub custom_height_mm: f64,
+    /// Area given to new copies, in cm²; 0 keeps the real size.
+    #[serde(default)]
+    pub area_cm2: f64,
 }
 
 fn default_page_w() -> f64 {
@@ -131,8 +134,9 @@ fn normalize_rotation(raw: f64) -> f64 {
     if !raw.is_finite() {
         return 0.0;
     }
+    // The sheet nests at 45° steps, so any of those survives a save and open.
     let turns = (raw.round() as i64).rem_euclid(360);
-    ((turns / 90) * 90).rem_euclid(360) as f64
+    (((turns + 22) / 45) * 45).rem_euclid(360) as f64
 }
 
 fn safe_id(id: &str) -> String {
@@ -332,6 +336,7 @@ fn sanitize_settings(mut settings: ProjectSettings) -> ProjectSettings {
     }
     settings.custom_width_mm = settings.custom_width_mm.clamp(20.0, 2000.0);
     settings.custom_height_mm = settings.custom_height_mm.clamp(20.0, 2000.0);
+    settings.area_cm2 = settings.area_cm2.clamp(0.0, 2000.0);
     if settings.orientation != "landscape" {
         settings.orientation = "portrait".to_string();
     }
@@ -723,6 +728,7 @@ mod tests {
             outline_pad_mm: 1.5,
             custom_width_mm: 210.0,
             custom_height_mm: 297.0,
+            area_cm2: 0.0,
         }
     }
 
@@ -918,12 +924,14 @@ mod tests {
     }
 
     #[test]
-    fn rounds_rotation_to_quarter_turns() {
+    fn rounds_rotation_to_the_turns_the_sheet_uses() {
         assert_eq!(normalize_rotation(90.0), 90.0);
         assert_eq!(normalize_rotation(270.0), 270.0);
         assert_eq!(normalize_rotation(360.0), 0.0);
         assert_eq!(normalize_rotation(-90.0), 270.0);
-        assert_eq!(normalize_rotation(45.0), 0.0);
+        assert_eq!(normalize_rotation(45.0), 45.0);
+        assert_eq!(normalize_rotation(50.0), 45.0);
+        assert_eq!(normalize_rotation(315.0), 315.0);
         assert_eq!(normalize_rotation(f64::NAN), 0.0);
     }
 }

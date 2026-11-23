@@ -12,14 +12,24 @@ const MAX_RASTER_PX: u32 = 4000;
 
 pub struct Item {
     pub path: PathBuf,
+    /// Top-left of the footprint on the page, the cut line included.
     pub x_mm: f64,
     /// Distance from the top edge of the page.
     pub y_mm: f64,
-    /// Footprint on the sheet, rotation already applied.
-    pub width_mm: f64,
-    pub height_mm: f64,
-    /// Clockwise quarter turns: 0, 90, 180 or 270.
+    /// Clockwise rotation in degrees: a multiple of 45.
     pub rotation: f64,
+    /// Artwork box inside the footprint, and where it starts, before rotating.
+    pub art_x_mm: f64,
+    pub art_y_mm: f64,
+    pub art_w_mm: f64,
+    pub art_h_mm: f64,
+}
+
+impl Item {
+    /// Artwork with no size cannot be drawn, and its file is never opened.
+    fn has_art(&self) -> bool {
+        self.art_w_mm > 0.0 && self.art_h_mm > 0.0
+    }
 }
 
 pub struct PageSpec {
@@ -58,26 +68,13 @@ fn px_for(mm: f64) -> u32 {
     ((mm.max(0.1) / 25.4 * PRINT_DPI).round() as i64).clamp(1, MAX_RASTER_PX as i64) as u32
 }
 
-fn is_quarter_turn(rotation: f64) -> bool {
-    let quarter = (rotation.round() as i64).rem_euclid(360) / 90;
-    quarter % 2 == 1
-}
-
-/// The box the artwork is fitted into, before the copy is turned on the sheet.
-fn unrotated_box(item: &Item) -> (f64, f64) {
-    if is_quarter_turn(item.rotation) {
-        (item.height_mm, item.width_mm)
-    } else {
-        (item.width_mm, item.height_mm)
-    }
-}
-
-/// Centre of the footprint in page points, plus the cosine and sine of its
-/// clockwise rotation.
+/// Centre of the artwork in page points, plus the cosine and sine of its
+/// clockwise rotation. The artwork is turned around its own centre inside the
+/// footprint, so a 45° copy still lands where the sheet shows it.
 fn item_transform(item: &Item, page_h_mm: f64) -> (f64, f64, f64, f64) {
-    let cx = mm_to_pt(item.x_mm + item.width_mm / 2.0);
-    let cy = mm_to_pt(page_h_mm - item.y_mm - item.height_mm / 2.0);
-    let angle = (item.rotation.round() as f64).to_radians();
+    let cx = mm_to_pt(item.x_mm + item.art_x_mm + item.art_w_mm / 2.0);
+    let cy = mm_to_pt(page_h_mm - item.y_mm - item.art_y_mm - item.art_h_mm / 2.0);
+    let angle = item.rotation.to_radians();
     (cx, cy, angle.cos(), angle.sin())
 }
 
@@ -253,7 +250,7 @@ pub fn export(dest: &Path, pages: &[PageSpec], outline: Option<&Outline>) -> Res
     let mut seen: HashSet<String> = HashSet::new();
     for page in pages {
         for item in &page.items {
-            if item.width_mm <= 0.0 || item.height_mm <= 0.0 {
+            if !item.has_art() {
                 continue;
             }
             let key = key_of(&item.path);
@@ -280,14 +277,13 @@ pub fn export(dest: &Path, pages: &[PageSpec], outline: Option<&Outline>) -> Res
     }
     for page in pages {
         for item in &page.items {
-            if item.width_mm <= 0.0 || item.height_mm <= 0.0 {
+            if !item.has_art() {
                 continue;
             }
             let source = sources
                 .get_mut(&key_of(&item.path))
                 .expect("file registered above");
-            let (box_w, box_h) = unrotated_box(item);
-            let (w_mm, h_mm) = fit_inside(box_w, box_h, source.aspect);
+            let (w_mm, h_mm) = fit_inside(item.art_w_mm, item.art_h_mm, source.aspect);
             source.fitted_w = source.fitted_w.max(w_mm);
             source.fitted_h = source.fitted_h.max(h_mm);
         }
@@ -337,12 +333,11 @@ pub fn export(dest: &Path, pages: &[PageSpec], outline: Option<&Outline>) -> Res
             let (Some(idx), aspect) = (source.index, source.aspect) else {
                 continue;
             };
-            if item.width_mm <= 0.0 || item.height_mm <= 0.0 {
+            if !item.has_art() {
                 continue;
             }
             // Same "contain" behaviour as the on-screen preview.
-            let (box_w, box_h) = unrotated_box(item);
-            let (w_mm, h_mm) = fit_inside(box_w, box_h, aspect);
+            let (w_mm, h_mm) = fit_inside(item.art_w_mm, item.art_h_mm, aspect);
             let w = mm_to_pt(w_mm);
             let h = mm_to_pt(h_mm);
             let (cx, cy, cos, sin) = item_transform(item, page.height_mm);
@@ -368,11 +363,10 @@ pub fn export(dest: &Path, pages: &[PageSpec], outline: Option<&Outline>) -> Res
                 let Some(source) = sources.get(&key_of(&item.path)) else {
                     continue;
                 };
-                if item.width_mm <= 0.0 || item.height_mm <= 0.0 {
+                if !item.has_art() {
                     continue;
                 }
-                let (box_w, box_h) = unrotated_box(item);
-                let (w_mm, h_mm) = fit_inside(box_w, box_h, source.aspect);
+                let (w_mm, h_mm) = fit_inside(item.art_w_mm, item.art_h_mm, source.aspect);
                 let (cx, cy, cos, sin) = item_transform(item, page.height_mm);
                 let art_w = mm_to_pt(w_mm);
                 let art_h = mm_to_pt(h_mm);
@@ -487,9 +481,11 @@ mod tests {
                 path: img_path.clone(),
                 x_mm: 10.0,
                 y_mm: 20.0,
-                width_mm: 50.0,
-                height_mm: 50.0,
                 rotation: 0.0,
+                art_x_mm: 0.0,
+                art_y_mm: 0.0,
+                art_w_mm: 50.0,
+                art_h_mm: 50.0,
             }],
         };
         let dest = dir.join("out.pdf");
@@ -534,9 +530,11 @@ mod tests {
                     path: img_path,
                     x_mm: 0.0,
                     y_mm: 0.0,
-                    width_mm: 25.4,
-                    height_mm: 25.4,
                     rotation: 0.0,
+                    art_x_mm: 0.0,
+                    art_y_mm: 0.0,
+                    art_w_mm: 25.4,
+                    art_h_mm: 25.4,
                 }],
             }],
             None,
@@ -590,9 +588,11 @@ mod tests {
                     x_mm: 0.0,
                     y_mm: 0.0,
                     // Square box for a 2:1 image: the art is letterboxed.
-                    width_mm: 25.4,
-                    height_mm: 25.4,
                     rotation: 0.0,
+                    art_x_mm: 0.0,
+                    art_y_mm: 0.0,
+                    art_w_mm: 25.4,
+                    art_h_mm: 25.4,
                 }],
             }],
             None,
@@ -618,9 +618,11 @@ mod tests {
             path: img_path.clone(),
             x_mm: 0.0,
             y_mm: 0.0,
-            width_mm: mm,
-            height_mm: mm,
             rotation: 0.0,
+            art_x_mm: 0.0,
+            art_y_mm: 0.0,
+            art_w_mm: mm,
+            art_h_mm: mm,
         };
         export(
             &dest,
@@ -666,9 +668,11 @@ mod tests {
                     path,
                     x_mm: 10.0,
                     y_mm: 10.0,
-                    width_mm: 50.0,
-                    height_mm: 50.0,
                     rotation: 0.0,
+                    art_x_mm: 0.0,
+                    art_y_mm: 0.0,
+                    art_w_mm: 50.0,
+                    art_h_mm: 50.0,
                 }],
             }],
             Some(&Outline {
@@ -692,24 +696,16 @@ mod tests {
             path: PathBuf::from("x.png"),
             x_mm: 10.0,
             y_mm: 20.0,
-            width_mm: 60.0,
-            height_mm: 40.0,
             rotation,
+            art_x_mm: 5.0,
+            art_y_mm: 3.0,
+            art_w_mm: 50.0,
+            art_h_mm: 34.0,
         }
     }
 
     #[test]
-    fn quarter_turns_swap_the_box_the_art_is_fitted_into() {
-        assert_eq!(unrotated_box(&item(0.0)), (60.0, 40.0));
-        assert_eq!(unrotated_box(&item(90.0)), (40.0, 60.0));
-        assert_eq!(unrotated_box(&item(180.0)), (60.0, 40.0));
-        assert_eq!(unrotated_box(&item(270.0)), (40.0, 60.0));
-        assert!(is_quarter_turn(90.0) && is_quarter_turn(270.0));
-        assert!(!is_quarter_turn(0.0) && !is_quarter_turn(180.0));
-    }
-
-    #[test]
-    fn rotation_turns_around_the_footprint_centre() {
+    fn the_rotation_turns_the_artwork_around_its_own_centre() {
         let (cx, cy, cos, sin) = item_transform(&item(90.0), 297.0);
         assert!((cx - mm_to_pt(40.0)).abs() < 1e-9);
         assert!((cy - mm_to_pt(297.0 - 20.0 - 20.0)).abs() < 1e-9);
@@ -729,9 +725,11 @@ mod tests {
                     path: dir.join("nope.png"),
                     x_mm: 0.0,
                     y_mm: 0.0,
-                    width_mm: 10.0,
-                    height_mm: 10.0,
                     rotation: 0.0,
+                    art_x_mm: 0.0,
+                    art_y_mm: 0.0,
+                    art_w_mm: 10.0,
+                    art_h_mm: 10.0,
                 }],
             }],
             None,

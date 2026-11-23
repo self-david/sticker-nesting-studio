@@ -3,6 +3,7 @@ mod archive;
 mod contour;
 mod db;
 mod importer;
+mod nest;
 mod pdf;
 mod project;
 
@@ -706,16 +707,29 @@ async fn sticker_contour(
     .map_err(|e| e.to_string())?
 }
 
+/// Fits the whole sheet with each sticker's real silhouette. Tracing and
+/// placing are heavy, so both run off the UI thread.
+#[tauri::command]
+async fn nest_sheet(
+    copies: Vec<nest::NestCopy>,
+    settings: nest::NestSettings,
+) -> Result<nest::NestResult, String> {
+    tauri::async_runtime::spawn_blocking(move || nest::nest(&copies, &settings))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PdfExportItem {
     path: String,
     x_mm: f64,
     y_mm: f64,
-    width_mm: f64,
-    height_mm: f64,
-    #[serde(default)]
     rotation: f64,
+    art_x_mm: f64,
+    art_y_mm: f64,
+    art_w_mm: f64,
+    art_h_mm: f64,
 }
 
 #[derive(Deserialize)]
@@ -753,9 +767,11 @@ fn export_sheet_pdf(
                     path: PathBuf::from(item.path),
                     x_mm: item.x_mm,
                     y_mm: item.y_mm,
-                    width_mm: item.width_mm,
-                    height_mm: item.height_mm,
                     rotation: item.rotation,
+                    art_x_mm: item.art_x_mm,
+                    art_y_mm: item.art_y_mm,
+                    art_w_mm: item.art_w_mm,
+                    art_h_mm: item.art_h_mm,
                 })
                 .collect(),
         })
@@ -833,6 +849,16 @@ fn open_saved_sheet(state: State<'_, AppState>, id: String) -> Result<String, St
 }
 
 #[tauri::command]
+fn rename_saved_sheet(
+    state: State<'_, AppState>,
+    id: String,
+    name: String,
+) -> Result<db::SavedSheet, String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    db::rename_sheet(&conn, &id, &name)
+}
+
+#[tauri::command]
 fn delete_saved_sheet(state: State<'_, AppState>, id: String) -> Result<usize, String> {
     let conn = state.conn.lock().map_err(|e| e.to_string())?;
     db::delete_sheet(&conn, &id)
@@ -897,12 +923,14 @@ pub fn run() {
             delete_stickers,
             library_info,
             sticker_contour,
+            nest_sheet,
             export_sheet_pdf,
             save_sheet_project,
             open_sheet_project,
             list_saved_sheets,
             save_saved_sheet,
             open_saved_sheet,
+            rename_saved_sheet,
             delete_saved_sheet,
             reveal_library
         ])

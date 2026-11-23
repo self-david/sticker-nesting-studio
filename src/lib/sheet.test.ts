@@ -13,15 +13,38 @@ import {
   MAX_SIZE_MM,
   MIN_SIZE_MM,
   copiesFromSticker,
-  footprint,
+  resizeCopiesToArea,
   resizeCopy,
   rotateCopy,
-  layoutSheet,
   pageDimensions,
+  sheetFileName,
+  sizeFromArea,
   type Rotation,
   type SheetCopy,
 } from "./sheet";
 import type { Sticker } from "../types";
+
+describe("size from area", () => {
+  test("keeps the shape and gives the asked area", () => {
+    // 20 cm² on a 4:3 sticker: 16.3 × 12.2 mm… squared is 20 cm².
+    const sized = sizeFromArea(4 / 3, 20)!;
+    expect(sized).not.toBeNull();
+    expect(sized.widthMm / sized.heightMm).toBeCloseTo(4 / 3, 1);
+    expect((sized.widthMm * sized.heightMm) / 100).toBeCloseTo(20, 0);
+  });
+
+  test("zero means keeping the sticker's real size", () => {
+    expect(sizeFromArea(1, 0)).toBeNull();
+  });
+
+  test("the copies already on the sheet take the area and keep their shape", () => {
+    const even = resizeCopiesToArea([copy("a", 40, 20), copy("b", 12, 36, 1 / 3)], 30);
+    expect(even[0].widthMm * even[0].heightMm).toBeCloseTo(3000, -1);
+    expect(even[1].widthMm * even[1].heightMm).toBeCloseTo(3000, -1);
+    expect(even[1].widthMm / even[1].heightMm).toBeCloseTo(1 / 3, 1);
+    expect(even[0].id).toBe("a");
+  });
+});
 
 describe("custom paper", () => {
   const custom = {
@@ -34,13 +57,6 @@ describe("custom paper", () => {
   test("measures the page in millimetres and turns with the orientation", () => {
     expect(pageDimensions(custom)).toEqual({ w: 330, h: 120 });
     expect(pageDimensions({ ...custom, orientation: "landscape" })).toEqual({ w: 120, h: 330 });
-  });
-
-  test("lays out copies inside the custom page", () => {
-    const layout = layoutSheet([copy("a", 40, 20), copy("b", 40, 20)], custom);
-    expect(layout.pageW).toBe(330);
-    expect(layout.pageH).toBe(120);
-    expect(layout.pages[0]).toHaveLength(2);
   });
 });
 
@@ -105,235 +121,33 @@ describe("copiesFromSticker", () => {
   });
 });
 
-// Plain geometry, without the room reserved for cut lines.
-const settings = { ...DEFAULT_SETTINGS, marginMm: 10, gapMm: 4, cutLines: false };
-
-const placements = (copies: SheetCopy[]) => {
-  const layout = layoutSheet(copies, settings);
-  return {
-    layout,
-    byId: new Map(layout.pages.flat().map((p) => [p.copy.id, p])),
-  };
-};
-
-describe("layoutSheet turns a copy to fit", () => {
-  test("tries the quarter turn before starting a new page", () => {
-    // The first piece fills the width, leaving a 73 mm strip under it: the
-    // tall piece fits there only when it is turned.
-    const { layout, byId } = placements([copy("big", 190, 200), copy("strip", 60, 150)]);
-
-    expect(layout.pages).toHaveLength(1);
-    const placement = byId.get("strip")!;
-    expect(placement.rotation).toBe(90);
-    expect(placement.widthMm).toBe(150);
-    expect(placement.heightMm).toBe(60);
-    expect(placement.y).toBeGreaterThanOrEqual(10 + 200 + 4);
+describe("export file name", () => {
+  test("takes the sheet's name when it has one", () => {
+    expect(sheetFileName("todos los stickers", "hoja-stickers", "pdf")).toBe(
+      "todos los stickers.pdf",
+    );
   });
 
-  test("keeps the copy's own orientation when it fits", () => {
-    const { layout, byId } = placements([copy("big", 190, 200), copy("wide", 100, 50)]);
-
-    expect(layout.pages).toHaveLength(1);
-    expect(byId.get("wide")!.rotation).toBe(0);
-    expect(byId.get("wide")!.widthMm).toBe(100);
+  test("falls back to the neutral name for an unnamed sheet", () => {
+    expect(sheetFileName("", "hoja-stickers", "pdf")).toBe("hoja-stickers.pdf");
+    expect(sheetFileName("   ", "hoja-stickers", "sns")).toBe("hoja-stickers.sns");
   });
 
-  test("turns a copy the user already rotated one more quarter", () => {
-    // Upright it is 100 x 40 turned by the user, so its footprint is 40 x 100;
-    // the strip only takes it at 100 x 40, which is one more quarter turn.
-    const { byId } = placements([copy("big", 190, 200), copy("turned", 100, 40, 2.5, 90)]);
-
-    expect(byId.get("turned")!.rotation).toBe(180);
-    expect(byId.get("turned")!.widthMm).toBe(100);
-    expect(byId.get("turned")!.heightMm).toBe(40);
-  });
-
-  test("places a copy that is too wide turned on its own page", () => {
-    const { layout, byId } = placements([copy("tooWide", 220, 150)]);
-
-    expect(layout.unplaced).toHaveLength(0);
-    expect(layout.pages).toHaveLength(1);
-    const placement = byId.get("tooWide")!;
-    expect(placement.rotation).toBe(90);
-    expect(placement.widthMm).toBe(150);
-    expect(placement.heightMm).toBe(220);
-  });
-
-  test("reports a copy that fits in neither orientation, without an empty page", () => {
-    const { layout } = placements([copy("huge", 300, 300)]);
-
-    expect(layout.pages).toHaveLength(1);
-    expect(layout.pages[0]).toHaveLength(0);
-    expect(layout.unplaced.map((c) => c.id)).toEqual(["huge"]);
-  });
-});
-
-describe("layoutSheet", () => {
-  test("fills the pocket a row packer would leave empty", () => {
-    const { byId } = placements([
-      copy("tall", 110, 110),
-      copy("wide", 90, 30),
-      copy("star", 50, 50),
-      copy("small", 40, 40),
-    ]);
-
-    const star = byId.get("star")!;
-    const small = byId.get("small")!;
-    // Both sit to the right of the tall sticker, at the top of the area.
-    expect(star.x).toBe(124);
-    expect(star.y).toBe(10);
-    expect(small.x).toBe(124);
-    expect(small.y).toBe(64);
-  });
-
-  test("keeps every copy inside the area and apart by the gap", () => {
-    const copies = [
-      copy("a", 100, 80),
-      copy("b", 70, 120),
-      copy("c", 60, 40),
-      copy("d", 55, 55),
-      copy("e", 90, 35),
-      copy("f", 40, 90),
-    ];
-    const { layout } = placements(copies);
-    const all = layout.pages.flat();
-    expect(all).toHaveLength(copies.length);
-
-    for (const p of all) {
-      expect(p.x).toBeGreaterThanOrEqual(layout.areaX);
-      expect(p.y).toBeGreaterThanOrEqual(layout.areaY);
-      expect(p.x + p.widthMm).toBeLessThanOrEqual(layout.areaX + layout.areaW);
-      expect(p.y + p.heightMm).toBeLessThanOrEqual(layout.areaY + layout.areaH);
-    }
-
-    for (const page of layout.pages) {
-      for (let i = 0; i < page.length; i += 1) {
-        for (let j = i + 1; j < page.length; j += 1) {
-          const a = page[i];
-          const b = page[j];
-          const apart =
-            a.x + a.widthMm + settings.gapMm <= b.x + 1e-9 ||
-            b.x + b.widthMm + settings.gapMm <= a.x + 1e-9 ||
-            a.y + a.heightMm + settings.gapMm <= b.y + 1e-9 ||
-            b.y + b.heightMm + settings.gapMm <= a.y + 1e-9;
-          expect(apart).toBe(true);
-        }
-      }
-    }
-  });
-
-  test("reports copies that cannot fit instead of shrinking them", () => {
-    const huge = copy("huge", 200, 200);
-    const { layout } = placements([huge]);
-    expect(layout.unplaced.map((c) => c.id)).toEqual(["huge"]);
-    expect(layout.pages.flat()).toHaveLength(0);
-  });
-
-  test("opens another page when the current one is full", () => {
-    const copies = Array.from({ length: 12 }, (_, i) => copy(`c${i}`, 90, 90));
-    const { layout } = placements(copies);
-    // 2 columns x 2 rows per sheet (a third row would need 278 mm of 277).
-    expect(layout.pages.length).toBe(3);
-    expect(layout.pages[0]).toHaveLength(4);
-    expect(layout.pages[1]).toHaveLength(4);
-  });
-});
-
-describe("cut lines", () => {
-  const outlined = {
-    ...DEFAULT_SETTINGS,
-    marginMm: 10,
-    gapMm: 4,
-    outlinePadMm: 3,
-    outlineWidthMm: 0.4,
-  };
-  const room = outlined.outlinePadMm + outlined.outlineWidthMm / 2;
-
-  test("the outline room keeps every cut line inside the margin", () => {
-    const copies = Array.from({ length: 6 }, (_, i) => copy(`c${i}`, 55, 45));
-    const layout = layoutSheet(copies, outlined);
-    expect(layout.pages.flat()).toHaveLength(copies.length);
-
-    for (const p of layout.pages.flat()) {
-      // Box plus padding plus half the stroke: the outermost pixel drawn.
-      expect(p.x - room).toBeGreaterThanOrEqual(layout.areaX - 1e-9);
-      expect(p.y - room).toBeGreaterThanOrEqual(layout.areaY - 1e-9);
-      expect(p.x + p.widthMm + room).toBeLessThanOrEqual(layout.areaX + layout.areaW + 1e-9);
-      expect(p.y + p.heightMm + room).toBeLessThanOrEqual(layout.areaY + layout.areaH + 1e-9);
-    }
-  });
-
-  test("neighbouring cut lines keep the gap apart", () => {
-    const copies = Array.from({ length: 4 }, (_, i) => copy(`c${i}`, 50, 40));
-    const layout = layoutSheet(copies, outlined);
-    const page = layout.pages.flat();
-
-    for (let i = 0; i < page.length; i += 1) {
-      for (let j = i + 1; j < page.length; j += 1) {
-        const a = page[i];
-        const b = page[j];
-        const apart =
-          a.x + a.widthMm + room + outlined.gapMm <= b.x - room + 1e-9 ||
-          b.x + b.widthMm + room + outlined.gapMm <= a.x - room + 1e-9 ||
-          a.y + a.heightMm + room + outlined.gapMm <= b.y - room + 1e-9 ||
-          b.y + b.heightMm + room + outlined.gapMm <= a.y - room + 1e-9;
-        expect(apart).toBe(true);
-      }
-    }
-  });
-
-  test("without cut lines the sheet keeps the whole printable area", () => {
-    const plain = { ...DEFAULT_SETTINGS, marginMm: 10, gapMm: 4, cutLines: false };
-    const layout = layoutSheet([copy("a", 150, 100)], plain);
-    expect(layout.pages.flat()[0].x).toBe(layout.areaX);
-    expect(layout.pages.flat()[0].y).toBe(layout.areaY);
+  test("drops what a file name cannot hold", () => {
+    expect(sheetFileName("hoja/2: stickers?", "hoja", "pdf")).toBe("hoja2 stickers.pdf");
+    expect(sheetFileName("fin.", "hoja", "pdf")).toBe("fin.pdf");
   });
 });
 
 describe("rotation", () => {
-  test("a quarter turn swaps the footprint", () => {
-    const upright = copy("a", 80, 40);
-    expect(footprint(upright)).toEqual({ w: 80, h: 40 });
-    expect(footprint(rotateCopy(upright))).toEqual({ w: 40, h: 80 });
-    expect(footprint({ ...upright, rotation: 180 })).toEqual({ w: 80, h: 40 });
-  });
-
-  test("cycles through the four quarter turns", () => {
+  test("turns in 45° steps and comes back round", () => {
     let current = copy("a", 80, 40);
     const seen: number[] = [];
-    for (let i = 0; i < 4; i += 1) {
+    for (let i = 0; i < 8; i += 1) {
       current = rotateCopy(current);
       seen.push(current.rotation);
     }
-    expect(seen).toEqual([90, 180, 270, 0]);
-  });
-
-  test("lays out the rotated footprint and keeps the angle", () => {
-    // 150 mm tall, 150 mm wide area: upright it fits, turned it still does and
-    // the placement must carry the rotation and the swapped size.
-    const turned = copy("turned", 120, 90, undefined, 90);
-    const { layout } = placements([turned]);
-    const placed = layout.pages.flat()[0];
-    expect(placed.rotation).toBe(90);
-    expect(placed.widthMm).toBe(90);
-    expect(placed.heightMm).toBe(120);
-  });
-
-  test("a copy that only fits turned is no longer unplaced", () => {
-    // Landscape 281 x 194: 250 mm tall does not fit, turned it does.
-    const settings = {
-      ...DEFAULT_SETTINGS,
-      orientation: "landscape" as const,
-      marginMm: 8,
-      gapMm: 3,
-    };
-    const wide = copy("wide", 150, 250);
-    const layout = layoutSheet([wide], settings);
-    expect(layout.unplaced).toHaveLength(0);
-    const placement = layout.pages[0][0];
-    expect(placement.rotation).toBe(90);
-    expect(placement.widthMm).toBe(250);
-    expect(placement.heightMm).toBe(150);
+    expect(seen).toEqual([45, 90, 135, 180, 225, 270, 315, 0]);
   });
 
   test("resizing keeps the rotation", () => {

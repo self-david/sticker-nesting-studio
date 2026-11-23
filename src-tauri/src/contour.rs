@@ -3,7 +3,7 @@ use std::fs;
 use std::path::Path;
 
 /// Longest side used to trace silhouettes. Enough for print-sized outlines.
-const MAX_SIDE: u32 = 800;
+pub(crate) const MAX_SIDE: u32 = 800;
 /// Solid artwork only: soft drop shadows, glows and compression noise are not
 /// the shape. Sticker artwork usually carries a wide, near-invisible halo, and
 /// tracing it is what made the cut line wander far from the artwork.
@@ -38,7 +38,19 @@ pub fn shape_from_file(
     height_mm: f64,
     padding_mm: f64,
 ) -> Result<Shape, String> {
-    let (rgba, w, h) = load_rgba(path)?;
+    shape_from_file_at(path, width_mm, height_mm, padding_mm, MAX_SIDE)
+}
+
+/// Same trace, worked out on a coarser image. Nesting only needs the shape to
+/// fit a one millimetre grid, and a small canvas is many times faster.
+pub fn shape_from_file_at(
+    path: &Path,
+    width_mm: f64,
+    height_mm: f64,
+    padding_mm: f64,
+    max_side: u32,
+) -> Result<Shape, String> {
+    let (rgba, w, h) = load_rgba(path, max_side)?;
     let (w, h) = (w as usize, h as usize);
     if w == 0 || h == 0 {
         return Err("La imagen está vacía".into());
@@ -78,16 +90,18 @@ pub fn shape_from_file(
         canvas
     };
 
-    let mut contours = Vec::new();
+    let mut loops: Vec<(f64, Vec<Point>)> = Vec::new();
     for polygon in trace(&canvas, pw, ph) {
-        if polygon.len() < 3 || polygon_area(&polygon) < MIN_AREA_PX {
+        let area = signed_area(&polygon);
+        if polygon.len() < 3 || area.abs() < MIN_AREA_PX {
             continue;
         }
         let simplified = simplify(&polygon);
         if simplified.len() < 3 {
             continue;
         }
-        contours.push(
+        loops.push((
+            area,
             simplified
                 .into_iter()
                 .map(|(x, y)| {
@@ -97,8 +111,29 @@ pub fn shape_from_file(
                     )
                 })
                 .collect(),
-        );
+        ));
     }
+
+    // A sticker is cut along its outer edge only. Gaps inside the artwork (the
+    // space between an arm and the body, the middle of a letter) are painted,
+    // not cut, and outlining them drew a second line inside the sticker. Those
+    // holes run the other way round, so keeping the dominant winding leaves the
+    // silhouettes and drops the holes.
+    let dominant = loops
+        .iter()
+        .map(|(area, _)| *area)
+        .fold(0.0f64, |best: f64, area: f64| {
+            if area.abs() > best.abs() {
+                area
+            } else {
+                best
+            }
+        });
+    let contours: Vec<Vec<Point>> = loops
+        .into_iter()
+        .filter(|(area, _)| area * dominant > 0.0)
+        .map(|(_, polygon)| polygon)
+        .collect();
 
     if contours.is_empty() {
         return Ok(Shape::rectangle());
@@ -106,21 +141,21 @@ pub fn shape_from_file(
     Ok(Shape { contours })
 }
 
-pub(crate) fn load_rgba(path: &Path) -> Result<(Vec<u8>, u32, u32), String> {
+pub(crate) fn load_rgba(path: &Path, max_side: u32) -> Result<(Vec<u8>, u32, u32), String> {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
     if ext == "svg" {
-        return load_svg(path);
+        return load_svg(path, max_side);
     }
 
     let img = image::open(path).map_err(|e| format!("No se pudo abrir la imagen: {e}"))?;
     let (w, h) = (img.width(), img.height());
-    let max_side = w.max(h);
-    let img = if max_side > MAX_SIDE {
-        let scale = MAX_SIDE as f64 / max_side as f64;
+    let longest = w.max(h);
+    let img = if longest > max_side {
+        let scale = max_side as f64 / longest as f64;
         img.resize_exact(
             ((w as f64 * scale).round() as u32).max(1),
             ((h as f64 * scale).round() as u32).max(1),
@@ -135,7 +170,7 @@ pub(crate) fn load_rgba(path: &Path) -> Result<(Vec<u8>, u32, u32), String> {
 }
 
 /// SVG rendered with alpha, at a size suitable for tracing.
-fn load_svg(path: &Path) -> Result<(Vec<u8>, u32, u32), String> {
+fn load_svg(path: &Path, max_side: u32) -> Result<(Vec<u8>, u32, u32), String> {
     let data = fs::read(path).map_err(|e| format!("No se pudo leer el SVG: {e}"))?;
     let tree = resvg::usvg::Tree::from_data(&data, &resvg::usvg::Options::default())
         .map_err(|e| format!("SVG no válido: {e}"))?;
@@ -145,7 +180,7 @@ fn load_svg(path: &Path) -> Result<(Vec<u8>, u32, u32), String> {
         return Err("El SVG no declara un tamaño utilizable".into());
     }
 
-    let scale = MAX_SIDE as f64 / tw.max(th);
+    let scale = max_side as f64 / tw.max(th);
     let w = ((tw * scale).round() as u32).max(1);
     let h = ((th * scale).round() as u32).max(1);
     let mut pixmap = resvg::tiny_skia::Pixmap::new(w, h)
@@ -329,14 +364,15 @@ fn trace(mask: &[bool], w: usize, h: usize) -> Vec<Vec<Point>> {
     loops
 }
 
-fn polygon_area(points: &[Point]) -> f64 {
+/// Shoelace sum. Its sign tells an outer edge from a hole.
+fn signed_area(points: &[Point]) -> f64 {
     let mut sum = 0.0;
     for i in 0..points.len() {
         let (x1, y1) = points[i];
         let (x2, y2) = points[(i + 1) % points.len()];
         sum += x1 * y2 - x2 * y1;
     }
-    (sum / 2.0).abs()
+    sum / 2.0
 }
 
 fn simplify(points: &[Point]) -> Vec<Point> {
@@ -448,6 +484,28 @@ mod tests {
         assert!((min_y - 0.1).abs() < 0.008, "min_y = {min_y}");
         assert!((max_y - 0.9).abs() < 0.008, "max_y = {max_y}");
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_hole_inside_the_artwork_is_not_a_cut_line() {
+        let dir = temp_dir("donut");
+        let path = dir.join("donut.png");
+        let mut img = RgbaImage::from_pixel(200, 200, Rgba([0, 0, 0, 0]));
+        for y in 0..200i32 {
+            for x in 0..200i32 {
+                let (dx, dy) = (x as f64 - 100.0, y as f64 - 100.0);
+                let d = (dx * dx + dy * dy).sqrt();
+                if (40.0..=80.0).contains(&d) {
+                    img.put_pixel(x as u32, y as u32, Rgba([255, 0, 0, 255]));
+                }
+            }
+        }
+        img.save(&path).unwrap();
+
+        let shape = shape_from_file(&path, 50.0, 50.0, 0.0).unwrap();
+        // One line around the ring: the see-through middle is not outlined.
+        assert_eq!(shape.contours.len(), 1);
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -203,13 +203,16 @@ export function revealLibrary(): Promise<void> {
 
 export interface PdfExportItem {
   path: string;
+  /** Top-left of the footprint on the page, the cut line included. */
   xMm: number;
   yMm: number;
-  /** Footprint on the sheet (already rotated). */
-  widthMm: number;
-  heightMm: number;
-  /** Degrees clockwise: 0, 90, 180 or 270. */
+  /** Degrees clockwise: a multiple of 45. */
   rotation: number;
+  /** Artwork box inside that footprint, before rotating. */
+  artXMm: number;
+  artYMm: number;
+  artWMm: number;
+  artHMm: number;
 }
 
 export interface PdfExportPage {
@@ -323,8 +326,64 @@ export async function openSavedSheet(id: string): Promise<LoadedProject> {
   return hydrateProject(JSON.parse(payload) as LoadedProjectPayload);
 }
 
+export function renameSavedSheet(id: string, name: string): Promise<SavedSheet> {
+  return invoke<SavedSheet>("rename_saved_sheet", { id, name });
+}
+
 export function deleteSavedSheet(id: string): Promise<number> {
   return invoke<number>("delete_saved_sheet", { id });
+}
+
+export interface NestCopyInput {
+  id: string;
+  path: string;
+  widthMm: number;
+  heightMm: number;
+  /** Turned to by hand; the nester tries it first. */
+  rotation: number;
+}
+
+export interface NestSettingsInput {
+  paper: string;
+  orientation: string;
+  marginMm: number;
+  gapMm: number;
+  cutLines: boolean;
+  outlineWidthMm: number;
+  outlinePadMm: number;
+  customWidthMm: number;
+  customHeightMm: number;
+}
+
+export interface NestPlacementPayload {
+  copyId: string;
+  xMm: number;
+  yMm: number;
+  widthMm: number;
+  heightMm: number;
+  rotation: number;
+  artXMm: number;
+  artYMm: number;
+}
+
+export interface NestPayload {
+  pageW: number;
+  pageH: number;
+  areaX: number;
+  areaY: number;
+  areaW: number;
+  areaH: number;
+  pages: NestPlacementPayload[][];
+  unplaced: string[];
+  inkMm2: number;
+}
+
+/** Fits every copy by its silhouette; the heavy work happens in Rust. */
+export function nestSheet(
+  copies: NestCopyInput[],
+  settings: NestSettingsInput,
+): Promise<NestPayload> {
+  return invoke<NestPayload>("nest_sheet", { copies, settings });
 }
 
 /** Silhouette outlines in image-normalized coordinates (0..1, y down). */

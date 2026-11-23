@@ -1,4 +1,5 @@
 import {
+  MAX_AREA_CM2,
   MAX_PAPER_MM,
   MAX_SIZE_MM,
   MIN_PAPER_MM,
@@ -63,10 +64,11 @@ export interface LoadedProject {
   copies: SheetCopy[];
 }
 
-export function quarterTurn(value: number): Rotation {
+/** Any turn the nester uses (multiples of 45) survives a save and reopen. */
+export function normalizeAngle(value: number): Rotation {
   if (!Number.isFinite(value)) return 0;
   const turns = ((Math.round(value) % 360) + 360) % 360;
-  return ((Math.floor(turns / 90) * 90) % 360) as Rotation;
+  return (Math.round(turns / 45) * 45) % 360;
 }
 
 /**
@@ -87,6 +89,7 @@ export function hydrateProject(payload: LoadedProjectPayload): LoadedProject {
     outlinePadMm: clamp(Number(raw.outlinePadMm), 0, 30),
     customWidthMm: clamp(Number(raw.customWidthMm) || 210, MIN_PAPER_MM, MAX_PAPER_MM),
     customHeightMm: clamp(Number(raw.customHeightMm) || 297, MIN_PAPER_MM, MAX_PAPER_MM),
+    areaCm2: clamp(Number(raw.areaCm2) || 0, 0, MAX_AREA_CM2),
   };
 
   const seen = new Set<string>();
@@ -109,7 +112,7 @@ export function hydrateProject(payload: LoadedProjectPayload): LoadedProject {
       heightMm,
       aspect:
         Number.isFinite(copy.aspect) && copy.aspect > 0 ? copy.aspect : widthMm / heightMm,
-      rotation: quarterTurn(copy.rotation),
+      rotation: normalizeAngle(copy.rotation),
     });
   }
 
