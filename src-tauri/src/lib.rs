@@ -569,8 +569,14 @@ fn ai_reorder_keys(
 
 /// Names and tags the given stickers from their thumbnails. The caller decides
 /// the ids, so the same command serves both the bulk run and one sticker.
+/// `fresh` skips the cache: redoing one sticker on purpose always asks again,
+/// while a batch reuses the answers its files already have.
 #[tauri::command]
-async fn ai_describe(state: State<'_, AppState>, ids: Vec<String>) -> Result<ai::Report, String> {
+async fn ai_describe(
+    state: State<'_, AppState>,
+    ids: Vec<String>,
+    fresh: Option<bool>,
+) -> Result<ai::Report, String> {
     let Some((keys, model, _)) = ai::load(&state.root) else {
         return Err("Añade al menos una clave de Groq en «Renombrar con IA».".to_string());
     };
@@ -591,8 +597,37 @@ async fn ai_describe(state: State<'_, AppState>, ids: Vec<String>) -> Result<ai:
     let client = ai::client()?;
     let mut updated = Vec::new();
     let mut failures = Vec::new();
+    let mut cached = 0usize;
 
+    let use_cache = !fresh.unwrap_or(false);
     for source in sources {
+        // The very same artwork already answered once: replay it for free.
+        if use_cache && !source.hash.is_empty() {
+            let kept = {
+                let conn = state.conn.lock().map_err(|e| e.to_string())?;
+                db::cached_answer(&conn, &model, &source.hash)?
+            };
+            if let Some(raw) = kept {
+                if let Ok(answer) = ai::answer_from(&raw) {
+                    let saved = {
+                        let conn = state.conn.lock().map_err(|e| e.to_string())?;
+                        save_answer(&conn, &source.id, &answer)
+                    };
+                    match saved {
+                        Ok(()) => {
+                            updated.push(source.id);
+                            cached += 1;
+                        }
+                        Err(message) => failures.push(ai::Failure {
+                            id: source.id,
+                            message,
+                        }),
+                    }
+                    continue;
+                }
+            }
+        }
+
         let image = match ai::prepare(&source) {
             Ok(image) => image,
             Err(message) => {
@@ -624,15 +659,12 @@ async fn ai_describe(state: State<'_, AppState>, ids: Vec<String>) -> Result<ai:
                 };
                 let saved = {
                     let conn = state.conn.lock().map_err(|e| e.to_string())?;
-                    db::apply_ai(
-                        &conn,
-                        &source.id,
-                        &answer.name,
-                        &answer.serie,
-                        &answer.tipo,
-                        &answer.tags,
-                        &answer.texto,
-                    )
+                    let saved = save_answer(&conn, &source.id, &answer);
+                    if saved.is_ok() {
+                        // A cache miss here is a missed saving, never a failure.
+                        let _ = db::cache_answer(&conn, &model, &source.hash, &raw);
+                    }
+                    saved
                 };
                 match saved {
                     Ok(_) => updated.push(source.id),
@@ -649,7 +681,26 @@ async fn ai_describe(state: State<'_, AppState>, ids: Vec<String>) -> Result<ai:
         }
     }
 
-    Ok(ai::Report { updated, failures })
+    Ok(ai::Report {
+        updated,
+        failures,
+        cached,
+    })
+}
+
+/// Writes one vision answer on its sticker: the name, series, type, tags and
+/// printed text, all at once.
+fn save_answer(conn: &Connection, id: &str, answer: &ai::Answer) -> Result<(), String> {
+    db::apply_ai(
+        conn,
+        id,
+        &answer.name,
+        &answer.serie,
+        &answer.tipo,
+        &answer.tags,
+        &answer.texto,
+    )
+    .map(|_| ())
 }
 
 /// Fills the series and the type of every sticker that has not been classified
@@ -668,7 +719,11 @@ async fn ai_classify(state: State<'_, AppState>) -> Result<ai::Report, String> {
     let mut updated = Vec::new();
     let mut failures = Vec::new();
     if queue.is_empty() {
-        return Ok(ai::Report { updated, failures });
+        return Ok(ai::Report {
+            updated,
+            failures,
+            cached: 0,
+        });
     }
 
     let client = ai::client()?;
@@ -737,7 +792,11 @@ async fn ai_classify(state: State<'_, AppState>) -> Result<ai::Report, String> {
         }
     }
 
-    Ok(ai::Report { updated, failures })
+    Ok(ai::Report {
+        updated,
+        failures,
+        cached: 0,
+    })
 }
 
 /// One text-only request with the saved text model: no image, no artwork.

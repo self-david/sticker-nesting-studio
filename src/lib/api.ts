@@ -215,8 +215,9 @@ export function aiClassify(): Promise<AiReport> {
   return invoke<AiReport>("ai_classify");
 }
 
-export function aiDescribe(ids: string[]): Promise<AiReport> {
-  return invoke<AiReport>("ai_describe", { ids });
+/** `fresh` ignores the answer cache: one sticker redone on purpose asks again. */
+export function aiDescribe(ids: string[], fresh = false): Promise<AiReport> {
+  return invoke<AiReport>("ai_describe", { ids, fresh });
 }
 
 export function deleteStickers(ids: string[]): Promise<number> {

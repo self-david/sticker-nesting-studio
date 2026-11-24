@@ -43,6 +43,8 @@ pub struct Sticker {
 pub struct AiSource {
     pub id: String,
     pub path: std::path::PathBuf,
+    /// SHA-256 of the artwork, the key of the answer cache ("" = unknown).
+    pub hash: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -88,6 +90,15 @@ pub fn init(conn: &Connection) -> rusqlite::Result<()> {
             payload    TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_sheets_updated ON sheets(updated_at DESC);
+        -- The vision answer per artwork and model: re-importing or re-running
+        -- the same file costs no request, and changing the model invalidates it.
+        CREATE TABLE IF NOT EXISTS ai_answers (
+            model      TEXT NOT NULL,
+            hash       TEXT NOT NULL,
+            answer     TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (model, hash)
+        );
         "#,
     )?;
     // Libraries created before the AI and classification columns.
@@ -742,11 +753,11 @@ pub fn remove(conn: &Connection, id: &str) -> Result<Option<String>, String> {
 /// The sticker the AI should look at: its thumbnail, or the artwork itself.
 pub fn ai_source(conn: &Connection, root: &Path, id: &str) -> Result<Option<AiSource>, String> {
     let row = conn.query_row(
-        "SELECT file_name FROM stickers WHERE id = ?1",
+        "SELECT file_name, hash FROM stickers WHERE id = ?1",
         params![id],
-        |r| r.get::<_, String>(0),
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
     );
-    let file_name = match row {
+    let (file_name, hash) = match row {
         Ok(found) => found,
         Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
         Err(e) => return Err(e.to_string()),
@@ -764,7 +775,41 @@ pub fn ai_source(conn: &Connection, root: &Path, id: &str) -> Result<Option<AiSo
     Ok(Some(AiSource {
         id: id.to_string(),
         path,
+        hash,
     }))
+}
+
+/// The vision answer kept for one artwork and model, if it was already asked.
+pub fn cached_answer(conn: &Connection, model: &str, hash: &str) -> Result<Option<String>, String> {
+    use rusqlite::OptionalExtension;
+    conn.query_row(
+        "SELECT answer FROM ai_answers WHERE model = ?1 AND hash = ?2",
+        params![model, hash],
+        |r| r.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(|e| e.to_string())
+}
+
+/// Remembers the raw answer so a repeat of the same artwork costs no request.
+/// An empty hash (a row from before the column) has nothing to key on.
+pub fn cache_answer(
+    conn: &Connection,
+    model: &str,
+    hash: &str,
+    answer: &str,
+) -> Result<(), String> {
+    if hash.is_empty() || answer.trim().is_empty() {
+        return Ok(());
+    }
+    conn.execute(
+        "INSERT INTO ai_answers (model, hash, answer, created_at) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(model, hash) DO UPDATE SET answer = excluded.answer,
+                                               created_at = excluded.created_at",
+        params![model, hash, answer, now_ms()],
+    )
+    .map(|_| ())
+    .map_err(|e| e.to_string())
 }
 
 /// Stores what the AI returned and marks the sticker as already processed.
@@ -1253,6 +1298,63 @@ mod tests {
         assert_eq!(list[0].texto, "feliz cumpleaños");
         // A sticker without printed text keeps an empty column, never NULL.
         assert_eq!(list[0].name, "Tarta");
+    }
+
+    #[test]
+    fn an_answer_is_kept_by_model_and_hash() {
+        let conn = library();
+        assert_eq!(cached_answer(&conn, "vision/x", "h1").unwrap(), None);
+        cache_answer(&conn, "vision/x", "h1", r#"{"name":"Gato"}"#).unwrap();
+        assert_eq!(
+            cached_answer(&conn, "vision/x", "h1").unwrap().as_deref(),
+            Some(r#"{"name":"Gato"}"#)
+        );
+
+        // A second answer for the same artwork replaces the first.
+        cache_answer(&conn, "vision/x", "h1", r#"{"name":"Perro"}"#).unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM ai_answers", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
+        assert_eq!(
+            cached_answer(&conn, "vision/x", "h1").unwrap().as_deref(),
+            Some(r#"{"name":"Perro"}"#)
+        );
+
+        // Another model is another answer: it starts with an empty cache.
+        assert_eq!(cached_answer(&conn, "vision/y", "h1").unwrap(), None);
+
+        // Rows imported before the hash column have nothing to key on.
+        cache_answer(&conn, "vision/x", "", r#"{"name":"X"}"#).unwrap();
+        assert_eq!(cached_answer(&conn, "vision/x", "").unwrap(), None);
+    }
+
+    #[test]
+    fn the_ai_source_carries_the_hash_of_the_artwork() {
+        let conn = Connection::open_in_memory().unwrap();
+        init(&conn).unwrap();
+        insert(
+            &conn,
+            &NewSticker {
+                id: "h",
+                name: "Gato",
+                file_name: "h.png",
+                ext: "png",
+                kind: "raster",
+                width_px: 1.0,
+                height_px: 1.0,
+                width_mm: 10.0,
+                height_mm: 10.0,
+                dpi: 300.0,
+                has_alpha: true,
+                size_bytes: 1,
+                hash: "abc123",
+            },
+        )
+        .unwrap();
+        let source = ai_source(&conn, Path::new("C:/lib"), "h").unwrap().unwrap();
+        assert_eq!(source.hash, "abc123");
+        assert!(source.path.ends_with("h.png"));
     }
 
     fn second(conn: &Connection, id: &str, name: &str) {

@@ -150,9 +150,12 @@ export function AiPanel({
   const [done, setDone] = useState(0);
   const [goal, setGoal] = useState(0);
   const [failures, setFailures] = useState<AiFailure[]>([]);
-  const [summary, setSummary] = useState<{ updated: number; failed: number; cancelled: boolean } | null>(
-    null,
-  );
+  const [summary, setSummary] = useState<{
+    updated: number;
+    failed: number;
+    cancelled: boolean;
+    cached: number;
+  } | null>(null);
   const cancelRef = useRef(false);
 
   useEffect(() => {
@@ -289,6 +292,7 @@ export function AiPanel({
     const queue = pending.map((s) => s.id);
     const failed: AiFailure[] = [];
     let processed = 0;
+    let cached = 0;
     let stop = false;
 
     while (queue.length && !cancelRef.current && !stop) {
@@ -296,6 +300,7 @@ export function AiPanel({
       if (!id) break;
       try {
         const report = await aiDescribe([id]);
+        cached += report.cached;
         for (const failure of report.failures) {
           failed.push(failure);
           if (/api key|clave/i.test(failure.message)) stop = true;
@@ -315,6 +320,7 @@ export function AiPanel({
       updated: processed - failed.length,
       failed: failed.length,
       cancelled: cancelRef.current || stop,
+      cached,
     });
     await onUpdated();
   };
@@ -422,7 +428,12 @@ export function AiPanel({
                   ? t("ai.running", { done, n: goal })
                   : summary?.cancelled
                     ? t("ai.cancelled", { n: done })
-                    : t("ai.done", { n: summary?.updated ?? 0 })}
+                    : summary && summary.cached > 0
+                      ? t("ai.doneCached", {
+                          n: summary.updated,
+                          cached: summary.cached,
+                        })
+                      : t("ai.done", { n: summary?.updated ?? 0 })}
               </span>
               {!running && (summary?.failed ?? 0) > 0 && (
                 <span className="err small">{t("ai.failed", { n: summary?.failed ?? 0 })}</span>

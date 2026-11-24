@@ -393,7 +393,8 @@ export default function App() {
     async (id: string) => {
       setAiBusyId(id);
       try {
-        const report = await aiDescribe([id]);
+        // Redoing one sticker on purpose always asks the model, never the cache.
+        const report = await aiDescribe([id], true);
         if (report.failures.length > 0) {
           setToast({ kind: "err", text: report.failures[0].message });
         } else {

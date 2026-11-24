@@ -104,4 +104,6 @@ export interface MergeGroup {
 export interface AiReport {
   updated: string[];
   failures: AiFailure[];
+  /** Stickers answered from the cache instead of the API. */
+  cached: number;
 }

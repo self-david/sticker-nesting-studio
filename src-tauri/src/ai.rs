@@ -137,6 +137,8 @@ pub struct Failure {
 pub struct Report {
     pub updated: Vec<String>,
     pub failures: Vec<Failure>,
+    /// Stickers answered from the cache instead of the API.
+    pub cached: usize,
 }
 
 /// Why one call did not produce an answer: the caller decides whether to move
