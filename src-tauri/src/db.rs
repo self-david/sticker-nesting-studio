@@ -466,8 +466,19 @@ pub fn list(
 
     let q = query.trim().to_lowercase();
     if !q.is_empty() {
-        clauses.push("lower(name) LIKE ?".into());
-        vals.push(Box::new(format!("%{}%", q)));
+        // The fields the search box promises: name, tag, series and type.
+        // Only lowercased here; folding accents and forgiving typos is the
+        // in-memory filter's job.
+        clauses.push(
+            "(lower(name) LIKE ? OR lower(coalesce(serie, '')) LIKE ? \
+             OR lower(coalesce(tipo, '')) LIKE ? \
+             OR id IN (SELECT sticker_id FROM sticker_tags WHERE lower(tag) LIKE ?))"
+                .into(),
+        );
+        let like = format!("%{}%", q);
+        for _ in 0..4 {
+            vals.push(Box::new(like.clone()));
+        }
     }
     let clean_tags: Vec<String> = tags.iter().filter_map(|t| normalize_tag(t)).collect();
     if !clean_tags.is_empty() {
@@ -1135,6 +1146,27 @@ mod tests {
         assert_eq!(list[0].tipo, "videojuego");
         assert!(list[0].classified_at > 0);
         assert_eq!(known_series(&conn).unwrap(), vec!["Pokémon"]);
+    }
+
+    #[test]
+    fn the_search_box_looks_in_name_serie_tipo_and_tags() {
+        let conn = library();
+        set_classification(&conn, "a", "Pokémon", "videojuego").unwrap();
+        let search = |q: &str| -> Vec<String> {
+            list(&conn, Path::new("C:/lib"), q, &[], "name")
+                .unwrap()
+                .into_iter()
+                .map(|s| s.id)
+                .collect()
+        };
+
+        assert_eq!(search("pikachu"), vec!["a"]);
+        assert_eq!(search("poké"), vec!["a"], "la serie");
+        assert_eq!(search("videojuego"), vec!["a"], "el tipo");
+        assert_eq!(search("amarillo"), vec!["a"], "una etiqueta");
+        assert!(search("goku").is_empty());
+        // Nothing typed yet is not a filter.
+        assert_eq!(search("  ").len(), 1);
     }
 
     fn second(conn: &Connection, id: &str, name: &str) {

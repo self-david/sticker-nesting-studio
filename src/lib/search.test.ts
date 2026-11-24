@@ -209,6 +209,40 @@ describe("matchedFacets", () => {
   });
 });
 
+describe("errores de ortografía", () => {
+  const all = [kitty, tiger, bunny, simba, pikachu, dragon];
+
+  test("una letra de más o de menos sigue encontrando el nombre", () => {
+    expect(filterStickers(all, parseQuery("pikachuu"))).toEqual([pikachu]);
+    expect(filterStickers(all, parseQuery("gokuu"))).toEqual([dragon]);
+  });
+
+  test("la errata se perdona también en serie, tipo y etiquetas", () => {
+    expect(filterStickers(all, parseQuery("kity"))).toContain(kitty);
+    expect(filterStickers(all, parseQuery("dinsey"))).toContain(simba);
+  });
+
+  test("los filtros con prefijo siguen siendo exactos", () => {
+    expect(filterStickers(all, parseQuery("#sanrioo"))).toEqual([]);
+    expect(filterStickers(all, parseQuery("serie:dinsey"))).toEqual([]);
+  });
+
+  test("las palabras cortas no se adivinan", () => {
+    expect(filterStickers(all, parseQuery("gaat"))).toEqual([]);
+  });
+
+  test("stickerMatches perdona la errata igual que la lista", () => {
+    expect(stickerMatches(pikachu, parseQuery("pikachuu"))).toBe(true);
+    expect(stickerMatches(simba, parseQuery("dinsey"))).toBe(true);
+    expect(stickerMatches(pikachu, parseQuery("#sanrioo"))).toBe(false);
+  });
+
+  test("la errata convive con un segundo término", () => {
+    expect(filterStickers(all, parseQuery("pikachuu tipo:anime"))).toEqual([pikachu]);
+    expect(filterStickers(all, parseQuery("pikachuu tipo:cine"))).toEqual([]);
+  });
+});
+
 describe("filterStickers", () => {
   const all = [kitty, tiger, bunny];
 

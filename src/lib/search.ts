@@ -4,6 +4,8 @@ import type { Sticker } from "../types";
  * One search box, four ways to narrow: free words, `#tag`, `serie:name` and
  * `tipo:type`, plus `"exact phrases"`. Everything is compared folded (no case,
  * no accents), so `corazon` finds `corazón` and `serie:pokemon` finds `Pokémon`.
+ * A free word also forgives a typo (`pikachuu` finds `Pikachu`); the prefixed
+ * filters do not, because narrowing by prefix has to stay predictable.
  */
 export interface ParsedQuery {
   /** Free words: each one must appear in the name or in some tag. */
@@ -99,23 +101,72 @@ function startsAll(value: string, wanted: string[]): boolean {
   return wanted.every((needle) => value.startsWith(needle));
 }
 
-function matchesFolded({ name, tags, serie, tipo }: Folded, query: ParsedQuery): boolean {
-  if (!query.active) return true;
-  // Free words look everywhere the sticker names itself, columns included.
-  const anywhere = (needle: string) =>
+/** Free words look everywhere the sticker names itself, columns included. */
+function hit({ name, tags, serie, tipo }: Folded, needle: string): boolean {
+  return (
     name.includes(needle) ||
     serie.includes(needle) ||
     tipo.includes(needle) ||
-    tags.some((tag) => tag.includes(needle));
-  const startsATag = (wanted: string) => tags.some((tag) => tag.startsWith(wanted));
-
-  return (
-    query.phrases.every(anywhere) &&
-    query.terms.every(anywhere) &&
-    query.tags.every(startsATag) &&
-    (query.series.length === 0 || startsAll(serie, query.series)) &&
-    (query.tipos.length === 0 || startsAll(tipo, query.tipos))
+    tags.some((tag) => tag.includes(needle))
   );
+}
+
+/** `#tag`, `serie:`, `tipo:` and phrases stay exact; only free words are forgiven. */
+function matchesColumns(folded: Folded, query: ParsedQuery): boolean {
+  if (!query.active) return true;
+  return (
+    query.phrases.every((phrase) => hit(folded, phrase)) &&
+    query.tags.every((wanted) => folded.tags.some((tag) => tag.startsWith(wanted))) &&
+    (query.series.length === 0 || startsAll(folded.serie, query.series)) &&
+    (query.tipos.length === 0 || startsAll(folded.tipo, query.tipos))
+  );
+}
+
+/** A free word matches when it is there or one slip away; `#tag` and phrases do not. */
+function termHit(folded: Folded, term: string): boolean {
+  return hit(folded, term) || nearAnyWord(folded, term);
+}
+
+function matchesFolded(folded: Folded, query: ParsedQuery): boolean {
+  return matchesColumns(folded, query) && query.terms.every((term) => termHit(folded, term));
+}
+
+/** One slip in a short word, two in a long one; beyond that it is another word. */
+function editsAllowed(term: string): number {
+  if (term.length < 4) return 0;
+  return term.length >= 8 ? 2 : 1;
+}
+
+/**
+ * Optimal string alignment, which counts a swapped pair (`dinsey`) as one slip.
+ * Only whether the distance fits in `max` matters, so it bails out early.
+ */
+function nearWord(word: string, term: string, max: number): boolean {
+  if (Math.abs(word.length - term.length) > max) return false;
+  let before: number[] = [];
+  let prev = Array.from({ length: term.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= word.length; i++) {
+    const current = [i];
+    for (let j = 1; j <= term.length; j++) {
+      const cost = word[i - 1] === term[j - 1] ? 0 : 1;
+      let best = Math.min(prev[j] + 1, current[j - 1] + 1, prev[j - 1] + cost);
+      if (i > 1 && j > 1 && word[i - 1] === term[j - 2] && word[i - 2] === term[j - 1]) {
+        best = Math.min(best, before[j - 2] + 1);
+      }
+      current[j] = best;
+    }
+    before = prev;
+    prev = current;
+  }
+  return prev[term.length] <= max;
+}
+
+/** A typo is forgiven word by word: `pikachuu` meets «Pikachu», not a whole card. */
+function nearAnyWord(folded: Folded, term: string): boolean {
+  const max = editsAllowed(term);
+  if (max === 0) return false;
+  const words = `${folded.name} ${folded.serie} ${folded.tipo} ${folded.tags.join(" ")}`;
+  return words.split(/[^\p{L}\p{N}]+/u).some((word) => word.length > 0 && nearWord(word, term, max));
 }
 
 /** The sticker's tags in their original spelling, for the matching chips. */
@@ -192,7 +243,8 @@ export function filterStickers(
   return items.filter((sticker) => {
     const folded = foldSticker(sticker);
     return (
-      matchesFolded(folded, query) &&
+      matchesColumns(folded, query) &&
+      query.terms.every((term) => termHit(folded, term)) &&
       wanted.every((tag) => folded.tags.includes(tag)) &&
       (wantedSerie === null || folded.serie === wantedSerie) &&
       (wantedTipo === null || folded.tipo === wantedTipo)
