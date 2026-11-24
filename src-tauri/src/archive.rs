@@ -417,9 +417,16 @@ pub fn store(
 ) -> Result<(), String> {
     let plan = &outcome.plan;
     let file_name = format!("{}.{}", plan.id, plan.sticker.ext);
-    let size_bytes = fs::metadata(root.join("files").join(&file_name))
+    let target = root.join("files").join(&file_name);
+    let size_bytes = fs::metadata(&target)
         .map(|meta| meta.len() as i64)
         .unwrap_or(plan.sticker.size_bytes);
+    // The manifest carries no hash, and a replaced row would otherwise keep the
+    // hash of the artwork it no longer has: the cache and the dedupe would both
+    // answer for the old image. Read from the file that actually landed.
+    let hash = fs::read(&target)
+        .map(|bytes| importer::hash_bytes(&bytes))
+        .unwrap_or_default();
     let sticker = RestoredSticker {
         id: plan.id.clone(),
         name: plan.sticker.name.trim().to_string(),
@@ -443,6 +450,7 @@ pub fn store(
         tipo: plan.sticker.tipo.trim().to_string(),
         classified_at: plan.sticker.classified_at,
         texto: plan.sticker.texto.trim().to_string(),
+        hash,
         tags: plan.sticker.tags.clone(),
     };
     if sticker.name.is_empty() {
@@ -941,6 +949,14 @@ mod tests {
         assert!(list[0].ai_at > 0 || list[0].classified_at > 0);
         assert!(Path::new(&list[0].thumb_path).is_file());
 
+        // The manifest carries no hash: it is read again from the artwork itself,
+        // which is what the AI cache and the duplicate check rely on.
+        let restored = other.join("files").join(&list[0].file_name);
+        let expected = importer::hash_bytes(&fs::read(&restored).unwrap());
+        assert!(!expected.is_empty());
+        let source = db::ai_source(&fresh, &other, &list[0].id).unwrap().unwrap();
+        assert_eq!(source.hash, expected);
+
         fs::remove_dir_all(&root).unwrap();
         fs::remove_dir_all(&other).unwrap();
     }
@@ -1026,6 +1042,12 @@ mod tests {
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].name, "Pikachu");
         assert_eq!(list[0].tags, vec!["kawaii", "pokemon"]);
+
+        // Replacing refreshes the hash too: the row used to point at other bytes.
+        let file = root.join("files").join(&list[0].file_name);
+        let expected = importer::hash_bytes(&fs::read(&file).unwrap());
+        let source = db::ai_source(&target, &root, "s1").unwrap().unwrap();
+        assert_eq!(source.hash, expected);
 
         fs::remove_dir_all(&root).unwrap();
     }

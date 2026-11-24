@@ -657,6 +657,9 @@ pub struct RestoredSticker {
     pub tipo: String,
     pub classified_at: i64,
     pub texto: String,
+    /// SHA-256 of the artwork as it arrived, so the cache and the dedupe match
+    /// the bytes on disk rather than the ones this row used to have.
+    pub hash: String,
     pub tags: Vec<String>,
 }
 
@@ -666,8 +669,8 @@ pub fn insert_restored(conn: &mut Connection, s: &RestoredSticker) -> Result<(),
     tx.execute(
         "INSERT INTO stickers (id, name, file_name, ext, kind, width_px, height_px, width_mm, \
          height_mm, dpi, has_alpha, size_bytes, created_at, ai_at, serie, tipo, classified_at, \
-         texto) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+         texto, hash) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
         params![
             s.id,
             s.name,
@@ -687,6 +690,7 @@ pub fn insert_restored(conn: &mut Connection, s: &RestoredSticker) -> Result<(),
             s.tipo,
             s.classified_at,
             s.texto,
+            s.hash,
         ],
     )
     .map_err(|e| e.to_string())?;
@@ -701,7 +705,7 @@ pub fn replace_restored(conn: &mut Connection, s: &RestoredSticker) -> Result<()
         "UPDATE stickers SET name = ?2, file_name = ?3, ext = ?4, kind = ?5, width_px = ?6, \
          height_px = ?7, width_mm = ?8, height_mm = ?9, dpi = ?10, has_alpha = ?11, \
          size_bytes = ?12, created_at = ?13, ai_at = ?14, serie = ?15, tipo = ?16, \
-         classified_at = ?17, texto = ?18 WHERE id = ?1",
+         classified_at = ?17, texto = ?18, hash = ?19 WHERE id = ?1",
         params![
             s.id,
             s.name,
@@ -721,6 +725,7 @@ pub fn replace_restored(conn: &mut Connection, s: &RestoredSticker) -> Result<()
             s.tipo,
             s.classified_at,
             s.texto,
+            s.hash,
         ],
     )
     .map_err(|e| e.to_string())?;
