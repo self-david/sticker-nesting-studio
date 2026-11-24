@@ -103,6 +103,162 @@ pub fn svg_size(text: &str) -> Option<(f64, f64)> {
     }
 }
 
+/// Physical resolution the file itself declares, in dots per inch. `None` means
+/// the artwork carries no density, so the caller falls back to 300 dpi.
+fn declared_dpi(bytes: &[u8], ext: &str) -> Option<f64> {
+    match ext {
+        "png" => png_dpi(bytes),
+        "jpg" | "jpeg" => jpeg_dpi(bytes),
+        _ => None,
+    }
+}
+
+/// PNG stores its density in the `pHYs` chunk, in pixels per metre.
+fn png_dpi(bytes: &[u8]) -> Option<f64> {
+    const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    if bytes.len() < 8 || bytes[..8] != SIGNATURE {
+        return None;
+    }
+    let mut at = 8usize;
+    while at + 8 <= bytes.len() {
+        let len = u32::from_be_bytes(bytes[at..at + 4].try_into().ok()?) as usize;
+        let kind = &bytes[at + 4..at + 8];
+        let start = at + 8;
+        let end = start.checked_add(len)?;
+        if end > bytes.len() {
+            return None;
+        }
+        if kind == &b"pHYs"[..] && len >= 9 {
+            let x = u32::from_be_bytes(bytes[start..start + 4].try_into().ok()?) as f64;
+            let unit = bytes[start + 8];
+            // Unit 1 means metres; 0 is an aspect ratio, not a physical size.
+            return (unit == 1 && x > 0.0).then_some(x * 0.0254);
+        }
+        // The rest of the file is pixels: no density will appear now.
+        if kind == &b"IDAT"[..] || kind == &b"IEND"[..] {
+            return None;
+        }
+        at = end.checked_add(4)?; // skip the CRC
+    }
+    None
+}
+
+/// JPEG declares density in the JFIF header (APP0) or, more precisely, in EXIF
+/// (APP1). Both are read: exporters write one, the other or both.
+fn jpeg_dpi(bytes: &[u8]) -> Option<f64> {
+    if bytes.len() < 4 || bytes[0] != 0xFF || bytes[1] != 0xD8 {
+        return None;
+    }
+    let mut at = 2usize;
+    while at + 1 < bytes.len() {
+        if bytes[at] != 0xFF {
+            at += 1; // resync on a damaged stream
+            continue;
+        }
+        let mut mark = at + 1;
+        while mark < bytes.len() && bytes[mark] == 0xFF {
+            mark += 1;
+        }
+        if mark >= bytes.len() {
+            return None;
+        }
+        let marker = bytes[mark];
+        at = mark + 1;
+        match marker {
+            // Markers without a length field, and the start of the scan, where
+            // no more metadata can appear.
+            0x01 | 0xD0..=0xD8 | 0xD9 | 0xDA => {
+                if marker == 0xD9 || marker == 0xDA {
+                    return None;
+                }
+                continue;
+            }
+            _ => {}
+        }
+        if at + 2 > bytes.len() {
+            return None;
+        }
+        let len = u16::from_be_bytes([bytes[at], bytes[at + 1]]) as usize;
+        if len < 2 || at + len > bytes.len() {
+            return None;
+        }
+        let segment = &bytes[at + 2..at + len];
+        if marker == 0xE0 && segment.starts_with(b"JFIF\0") && segment.len() >= 12 {
+            let units = segment[7];
+            let density = u16::from_be_bytes([segment[8], segment[9]]) as f64;
+            let dpi = match units {
+                1 => density,          // dots per inch
+                2 => density * 2.54,   // dots per centimetre
+                _ => 0.0,              // only an aspect ratio
+            };
+            return (dpi > 0.0).then_some(dpi);
+        }
+        if marker == 0xE1 && segment.starts_with(b"Exif\0\0") {
+            if let Some(dpi) = exif_dpi(&segment[6..]) {
+                return Some(dpi);
+            }
+        }
+        at += len;
+    }
+    None
+}
+
+/// Reads `XResolution` and `ResolutionUnit` from the first IFD of a TIFF block.
+fn exif_dpi(tiff: &[u8]) -> Option<f64> {
+    if tiff.len() < 8 {
+        return None;
+    }
+    let big = match &tiff[..2] {
+        b"II" => false,
+        b"MM" => true,
+        _ => return None,
+    };
+    let u16_at = |offset: usize| -> Option<u16> {
+        let bytes = tiff.get(offset..offset + 2)?;
+        Some(if big {
+            u16::from_be_bytes([bytes[0], bytes[1]])
+        } else {
+            u16::from_le_bytes([bytes[0], bytes[1]])
+        })
+    };
+    let u32_at = |offset: usize| -> Option<u32> {
+        let bytes = tiff.get(offset..offset + 4)?;
+        Some(if big {
+            u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+        } else {
+            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+        })
+    };
+    let rational_at = |offset: usize| -> Option<f64> {
+        let num = u32_at(offset)? as f64;
+        let den = u32_at(offset + 4)? as f64;
+        (den > 0.0).then_some(num / den)
+    };
+
+    if u16_at(2)? != 42 {
+        return None;
+    }
+    let ifd = u32_at(4)? as usize;
+    let count = u16_at(ifd)? as usize;
+    let mut resolution: Option<f64> = None;
+    let mut unit: u16 = 2; // inches, the EXIF default
+    for index in 0..count {
+        let entry = ifd.checked_add(2 + index * 12)?;
+        let tag = u16_at(entry)?;
+        let value = entry + 8;
+        match tag {
+            0x011A => resolution = rational_at(u32_at(value)? as usize),
+            0x0128 => unit = u16_at(value).unwrap_or(2),
+            _ => {}
+        }
+    }
+    let dpi = resolution?;
+    if !(dpi > 0.0) {
+        return None;
+    }
+    Some(if unit == 3 { dpi * 2.54 } else { dpi })
+}
+
 pub fn probe(src: &Path, ext: &str, thumbs: &Path, id: &str) -> Result<Probe, String> {
     if ext == "svg" {
         let text = fs::read_to_string(src).map_err(|e| format!("No se pudo leer el SVG: {e}"))?;
@@ -123,13 +279,22 @@ pub fn probe(src: &Path, ext: &str, thumbs: &Path, id: &str) -> Result<Probe, St
         });
     }
 
-    let img = image::open(src).map_err(|e| format!("No se pudo decodificar la imagen: {e}"))?;
+    // Read once: the density lives in the container, not in the pixels.
+    let bytes = fs::read(src).map_err(|e| format!("No se pudo leer la imagen: {e}"))?;
+    let img = image::load_from_memory(&bytes)
+        .map_err(|e| format!("No se pudo decodificar la imagen: {e}"))?;
     let (w, h) = img.dimensions();
     if w == 0 || h == 0 {
         return Err("La imagen está vacía".into());
     }
     let has_alpha = img.color().has_alpha();
-    let dpi = 300.0;
+    // The file's own density when it declares a sane one; 300 dpi is only the
+    // fallback for artwork that carries no physical size at all.
+    let dpi = round2(
+        declared_dpi(&bytes, ext)
+            .map(|value| value.clamp(30.0, 2400.0))
+            .unwrap_or(300.0),
+    );
 
     let thumb = img.thumbnail(THUMB_MAX, THUMB_MAX);
     let thumb_ext = if has_alpha { "png" } else { "jpg" };
@@ -177,6 +342,107 @@ pub fn target_file(files: &Path, id: &str, ext: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Minimal PNG signature plus one `pHYs` chunk.
+    fn png_with_density(ppm: u32, unit: u8) -> Vec<u8> {
+        let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        bytes.extend_from_slice(&9u32.to_be_bytes());
+        bytes.extend_from_slice(b"pHYs");
+        bytes.extend_from_slice(&ppm.to_be_bytes());
+        bytes.extend_from_slice(&ppm.to_be_bytes());
+        bytes.push(unit);
+        bytes.extend_from_slice(&[0, 0, 0, 0]); // CRC, not read
+        bytes
+    }
+
+    fn jpeg_with_jfif(units: u8, density: u16) -> Vec<u8> {
+        let mut segment = b"JFIF\0".to_vec();
+        segment.extend_from_slice(&[1, 1]);
+        segment.push(units);
+        segment.extend_from_slice(&density.to_be_bytes());
+        segment.extend_from_slice(&density.to_be_bytes());
+        segment.extend_from_slice(&[0, 0]);
+        let mut bytes = vec![0xFF, 0xD8, 0xFF, 0xE0];
+        bytes.extend_from_slice(&((segment.len() + 2) as u16).to_be_bytes());
+        bytes.extend_from_slice(&segment);
+        bytes.extend_from_slice(&[0xFF, 0xD9]);
+        bytes
+    }
+
+    /// APP1/EXIF with `XResolution` stored out of line, as cameras do.
+    fn jpeg_with_exif(dpi: u32, unit: u16) -> Vec<u8> {
+        let mut tiff = Vec::new();
+        tiff.extend_from_slice(b"II");
+        tiff.extend_from_slice(&42u16.to_le_bytes());
+        tiff.extend_from_slice(&8u32.to_le_bytes());
+        tiff.extend_from_slice(&2u16.to_le_bytes());
+        // XResolution -> RATIONAL at offset 38 (after the two entries).
+        tiff.extend_from_slice(&0x011Au16.to_le_bytes());
+        tiff.extend_from_slice(&5u16.to_le_bytes());
+        tiff.extend_from_slice(&1u32.to_le_bytes());
+        tiff.extend_from_slice(&38u32.to_le_bytes());
+        // ResolutionUnit -> SHORT, inline.
+        tiff.extend_from_slice(&0x0128u16.to_le_bytes());
+        tiff.extend_from_slice(&3u16.to_le_bytes());
+        tiff.extend_from_slice(&1u32.to_le_bytes());
+        tiff.extend_from_slice(&(unit as u32).to_le_bytes());
+        tiff.extend_from_slice(&0u32.to_le_bytes()); // no next IFD
+        tiff.extend_from_slice(&dpi.to_le_bytes());
+        tiff.extend_from_slice(&1u32.to_le_bytes());
+
+        let mut segment = b"Exif\0\0".to_vec();
+        segment.extend_from_slice(&tiff);
+        let mut bytes = vec![0xFF, 0xD8, 0xFF, 0xE1];
+        bytes.extend_from_slice(&((segment.len() + 2) as u16).to_be_bytes());
+        bytes.extend_from_slice(&segment);
+        bytes.extend_from_slice(&[0xFF, 0xD9]);
+        bytes
+    }
+
+    #[test]
+    fn reads_the_density_the_file_declares() {
+        // 11811 px/m is 300 dpi; PNG stores metres, JPEG stores inches.
+        let png = png_with_density(11811, 1);
+        assert!((declared_dpi(&png, "png").unwrap() - 300.0).abs() < 0.1);
+
+        let jfif = jpeg_with_jfif(1, 300);
+        assert!((declared_dpi(&jfif, "jpg").unwrap() - 300.0).abs() < 1e-6);
+
+        // Dots per centimetre: 118 dpcm is 299.72 dpi.
+        let cm = jpeg_with_jfif(2, 118);
+        assert!((declared_dpi(&cm, "jpeg").unwrap() - 299.72).abs() < 0.01);
+
+        let exif = jpeg_with_exif(150, 2);
+        assert!((declared_dpi(&exif, "jpg").unwrap() - 150.0).abs() < 1e-6);
+
+        // EXIF resolution in centimetres.
+        let exif_cm = jpeg_with_exif(60, 3);
+        assert!((declared_dpi(&exif_cm, "jpg").unwrap() - 152.4).abs() < 1e-6);
+
+        // An aspect-ratio-only pHYs and a file without metadata mean "unknown".
+        assert!(declared_dpi(&png_with_density(11811, 0), "png").is_none());
+        assert!(declared_dpi(b"\xFF\xD8\xFF\xD9", "jpg").is_none());
+        assert!(declared_dpi(&png, "webp").is_none());
+    }
+
+    #[test]
+    fn probe_reads_the_file_and_falls_back_to_300() {
+        let dir = std::env::temp_dir().join(format!("sns-probe-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cuadrado.png");
+        image::RgbaImage::from_pixel(8, 8, image::Rgba([255, 0, 0, 255]))
+            .save(&path)
+            .unwrap();
+
+        // A fresh PNG from the encoder declares no density: 300 dpi is used.
+        let probe = probe(&path, "png", &dir, "prueba").unwrap();
+        assert!((probe.dpi - 300.0).abs() < 1e-6);
+        assert!((probe.width_mm - 8.0 * 25.4 / 300.0).abs() < 0.01);
+        assert!(probe.has_alpha);
+        assert!(dir.join("prueba.png").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn lengths() {

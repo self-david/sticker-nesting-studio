@@ -1,7 +1,10 @@
+use rusqlite::backup::Backup;
 use rusqlite::{params, params_from_iter, Connection};
 use serde::Serialize;
 use std::collections::HashMap;
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -107,6 +110,88 @@ pub fn init(conn: &Connection) -> rusqlite::Result<()> {
          CREATE INDEX IF NOT EXISTS idx_stickers_tipo ON stickers(tipo);",
     )?;
     Ok(())
+}
+
+// --- copies of the library -------------------------------------------------
+
+/// How many daily copies are kept before the oldest one is dropped.
+const BACKUP_KEEP: usize = 5;
+
+/// Civil date from a day count, so the file names need no date library.
+/// Algorithm from Howard Hinnant's `chrono`-compatible `civil_from_days`.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if month <= 2 { year + 1 } else { year }, month, day)
+}
+
+fn today_utc() -> String {
+    let days = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| (elapsed.as_secs() / 86_400) as i64)
+        .unwrap_or(0);
+    let (year, month, day) = civil_from_days(days);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+/// `PRAGMA integrity_check`: the word `ok` when the file is sound, or the
+/// first problem SQLite found.
+pub fn check_integrity(conn: &Connection) -> Result<String, String> {
+    conn.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+        .map_err(|e| e.to_string())
+}
+
+/// Copies the database into `backups/library-YYYY-MM-DD.db`, once a day, and
+/// keeps the newest few. Uses SQLite's backup API, so pending WAL writes are
+/// included and the copy is never taken mid-transaction.
+pub fn backup(root: &Path, conn: &Connection) -> Result<Option<PathBuf>, String> {
+    let dir = root.join("backups");
+    fs::create_dir_all(&dir).map_err(|e| format!("No se pudo crear la carpeta de copias: {e}"))?;
+    let dest = dir.join(format!("library-{}.db", today_utc()));
+    if dest.exists() {
+        return Ok(None);
+    }
+
+    let tmp = dir.join("library.tmp.db");
+    let _ = fs::remove_file(&tmp);
+    {
+        let mut out =
+            Connection::open(&tmp).map_err(|e| format!("No se pudo preparar la copia: {e}"))?;
+        let copy = Backup::new(conn, &mut out)
+            .map_err(|e| format!("No se pudo abrir la copia: {e}"))?;
+        copy.run_to_completion(256, Duration::from_millis(0), None)
+            .map_err(|e| format!("No se pudo copiar la base de datos: {e}"))?;
+    }
+    fs::rename(&tmp, &dest).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        format!("No se pudo guardar la copia: {e}")
+    })?;
+    prune_backups(&dir, BACKUP_KEEP);
+    Ok(Some(dest))
+}
+
+/// Drops the oldest copies; the date in the name sorts chronologically.
+fn prune_backups(dir: &Path, keep: usize) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+        .filter(|name| name.starts_with("library-") && name.ends_with(".db"))
+        .collect();
+    names.sort();
+    let extra = names.len().saturating_sub(keep);
+    for name in names.into_iter().take(extra) {
+        let _ = fs::remove_file(dir.join(name));
+    }
 }
 
 pub fn normalize_tag(raw: &str) -> Option<String> {
@@ -995,5 +1080,32 @@ mod tests {
 
         // Anything that is not JSON never reaches the table.
         assert!(save_sheet(&conn, None, "Rota", "no es json").is_err());
+    }
+
+    #[test]
+    fn backup_names_carry_a_real_date() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(10_957), (2000, 1, 1));
+        assert_eq!(civil_from_days(19_782), (2024, 2, 29));
+    }
+
+    #[test]
+    fn the_daily_copy_is_written_once_and_stays_readable() {
+        let dir = std::env::temp_dir().join(format!("sns-backup-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = library();
+
+        let first = backup(&dir, &conn).unwrap().expect("a copy is due");
+        assert!(first.exists());
+        // The copy is a working database, with the same single sticker.
+        let copy = Connection::open(&first).unwrap();
+        assert_eq!(totals(&copy).unwrap().0, 1);
+        assert_eq!(check_integrity(&copy).unwrap(), "ok");
+
+        // A second run the same day does not pile up files.
+        assert!(backup(&dir, &conn).unwrap().is_none());
+        assert_eq!(std::fs::read_dir(dir.join("backups")).unwrap().count(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

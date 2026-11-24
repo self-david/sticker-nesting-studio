@@ -883,6 +883,29 @@ fn reveal_library(state: State<'_, AppState>) -> Result<(), String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // Must be the first plugin: a second launch focuses this window instead
+        // of opening a rival process over the same SQLite file.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }))
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                .target(tauri_plugin_log::Target::new(
+                    tauri_plugin_log::TargetKind::LogDir {
+                        file_name: Some("app".into()),
+                    },
+                ))
+                .target(tauri_plugin_log::Target::new(
+                    tauri_plugin_log::TargetKind::Stdout,
+                ))
+                .level(log::LevelFilter::Info)
+                .max_file_size(2 * 1024 * 1024)
+                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepOne)
+                .build(),
+        )
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let root = app.path().app_data_dir()?;
@@ -890,6 +913,19 @@ pub fn run() {
             fs::create_dir_all(root.join("thumbs"))?;
             let conn = Connection::open(root.join("library.db"))?;
             db::init(&conn)?;
+            // A damaged file is reported now, in the log, instead of surfacing
+            // later as an unreadable library.
+            match db::check_integrity(&conn) {
+                Ok(report) if report.trim() == "ok" => log::info!("base de datos íntegra"),
+                Ok(report) => log::error!("integrity_check: {report}"),
+                Err(message) => log::error!("no se pudo comprobar la base de datos: {message}"),
+            }
+            // One copy per day, before anything else writes to the library.
+            match db::backup(&root, &conn) {
+                Ok(Some(path)) => log::info!("copia de seguridad del día: {}", path.display()),
+                Ok(None) => log::info!("la copia de seguridad de hoy ya existe"),
+                Err(message) => log::warn!("no se pudo crear la copia de seguridad: {message}"),
+            }
             app.manage(AppState {
                 conn: Mutex::new(conn),
                 root,
