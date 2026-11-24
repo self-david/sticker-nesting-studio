@@ -1,4 +1,5 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import type {
   AiKeyCheck,
@@ -33,10 +34,9 @@ export function cancelImport(): Promise<void> {
 }
 
 /** Progress of the import: one event per file, off the UI thread. */
-export async function onImportProgress(
+export function onImportProgress(
   handler: (progress: ImportProgress) => void,
 ): Promise<() => void> {
-  const { listen } = await import("@tauri-apps/api/event");
   return listen<ImportProgress>("import:progress", (event) => handler(event.payload));
 }
 

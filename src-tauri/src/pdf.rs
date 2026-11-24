@@ -197,6 +197,42 @@ fn intrinsic_aspect(path: &Path) -> Result<f64, String> {
     Ok(w as f64 / h as f64)
 }
 
+/// Colour components of the first frame, when the file is a JPEG this PDF can
+/// carry untouched: baseline (0xC0) or extended sequential (0xC1). Progressive,
+/// lossless and arithmetic frames are turned down.
+fn jpeg_components(bytes: &[u8]) -> Option<u8> {
+    if bytes.len() < 4 || bytes[0] != 0xFF || bytes[1] != 0xD8 {
+        return None;
+    }
+    let mut at = 2usize;
+    while at + 2 <= bytes.len() {
+        if bytes[at] != 0xFF {
+            return None;
+        }
+        let mut mark = at + 1;
+        while mark < bytes.len() && bytes[mark] == 0xFF {
+            mark += 1;
+        }
+        let marker = *bytes.get(mark)?;
+        at = mark + 1;
+        match marker {
+            0xC0 | 0xC1 => return bytes.get(at + 7).copied(),
+            0xC2..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF => return None,
+            // Stand-alone markers carry no length.
+            0x01 | 0xD0..=0xD8 => continue,
+            // End of image or start of scan: no frame header left to read.
+            0xD9 | 0xDA => return None,
+            _ => {}
+        }
+        let len = u16::from_be_bytes([bytes[at], bytes[at + 1]]) as usize;
+        if len < 2 {
+            return None;
+        }
+        at += len;
+    }
+    None
+}
+
 /// Loads an image at no more than 300 dpi for the printed size it will occupy.
 fn load_raster(path: &Path, width_mm: f64, height_mm: f64) -> Result<Raster, String> {
     let ext = path
@@ -215,36 +251,46 @@ fn load_raster(path: &Path, width_mm: f64, height_mm: f64) -> Result<Raster, Str
         });
     }
 
-    let img = image::open(path).map_err(|e| format!("No se pudo abrir la imagen: {e}"))?;
-    let (width, height) = (img.width(), img.height());
-    if width == 0 || height == 0 {
+    let (src_w, src_h) = image::image_dimensions(path)
+        .map_err(|e| format!("No se pudo abrir la imagen: {e}"))?;
+    if src_w == 0 || src_h == 0 {
         return Err("La imagen está vacía".into());
     }
-
     // Never upscale; one shared scale so the stored aspect matches the source.
-    let scale = (px_for(width_mm) as f64 / width as f64)
-        .min(px_for(height_mm) as f64 / height as f64)
+    let scale = (px_for(width_mm) as f64 / src_w as f64)
+        .min(px_for(height_mm) as f64 / src_h as f64)
         .min(1.0);
+
+    // A photo that already fits goes into the PDF byte for byte: no second
+    // lossy pass and no bigger file than the source.
+    if matches!(ext.as_str(), "jpg" | "jpeg") && scale >= 1.0 {
+        let bytes = fs::read(path).map_err(|e| format!("No se pudo leer la imagen: {e}"))?;
+        if jpeg_components(&bytes) == Some(3) {
+            return Ok(Raster {
+                width: src_w,
+                height: src_h,
+                stream: bytes,
+                compression: Codec::Jpeg,
+            });
+        }
+    }
+
+    let img = image::open(path).map_err(|e| format!("No se pudo abrir la imagen: {e}"))?;
     let img = if scale < 1.0 {
-        let target_w = ((width as f64 * scale).round() as u32).max(1);
-        let target_h = ((height as f64 * scale).round() as u32).max(1);
+        let target_w = ((img.width() as f64 * scale).round() as u32).max(1);
+        let target_h = ((img.height() as f64 * scale).round() as u32).max(1);
         img.resize_exact(target_w, target_h, image::imageops::FilterType::Lanczos3)
     } else {
         img
     };
 
     let (width, height) = (img.width(), img.height());
-    // A JPEG source goes back out as JPEG: re-deflating it as raw RGB would
-    // multiply the PDF size for no gain in quality.
-    if ext == "jpg" || ext == "jpeg" {
-        let rgb = image::DynamicImage::ImageRgb8(img.to_rgb8());
+    // A JPEG that had to be rescaled is written back out as JPEG at high
+    // quality: raw RGB would multiply the PDF size for no visible gain.
+    if matches!(ext.as_str(), "jpg" | "jpeg") {
         let mut stream = Vec::new();
-        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(
-            &mut stream,
-            JPEG_QUALITY,
-        );
-        encoder
-            .encode_image(&rgb)
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut stream, JPEG_QUALITY)
+            .encode_image(&img)
             .map_err(|e| format!("No se pudo comprimir la foto: {e}"))?;
         return Ok(Raster {
             width,
@@ -552,44 +598,70 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn stores_jpeg_photos_as_jpeg() {
-        let dir = temp_dir("jpeg");
-        let img_path = dir.join("foto.jpg");
-        // A noisy block compresses far better as JPEG than as raw RGB.
-        let mut img = image::RgbImage::new(600, 600);
+    /// Noisy pixels: a photo-like JPEG, which is what the export must keep
+    /// compressed instead of storing as raw RGB.
+    fn noisy_jpeg(path: &Path, size: u32) {
+        let mut img = image::RgbImage::new(size, size);
         for (x, y, px) in img.enumerate_pixels_mut() {
             let v = ((x * 7 + y * 13) % 256) as u8;
             *px = image::Rgb([v, v.wrapping_mul(3), v.wrapping_add(17)]);
         }
-        img.save_with_format(&img_path, image::ImageFormat::Jpeg)
-            .unwrap();
+        img.save_with_format(path, image::ImageFormat::Jpeg).unwrap();
+    }
+
+    fn photo_page(path: &Path, mm: f64) -> PageSpec {
+        PageSpec {
+            width_mm: 100.0,
+            height_mm: 100.0,
+            items: vec![Item {
+                path: path.to_path_buf(),
+                x_mm: 0.0,
+                y_mm: 0.0,
+                rotation: 0.0,
+                art_x_mm: 0.0,
+                art_y_mm: 0.0,
+                art_w_mm: mm,
+                art_h_mm: mm,
+            }],
+        }
+    }
+
+    #[test]
+    fn embeds_the_original_bytes_of_a_jpeg_that_needs_no_downscale() {
+        let dir = temp_dir("jpeg-raw");
+        let img_path = dir.join("foto.jpg");
+        noisy_jpeg(&img_path, 600);
+        let source = fs::read(&img_path).unwrap();
 
         let dest = dir.join("foto.pdf");
-        export(
-            &dest,
-            &[PageSpec {
-                width_mm: 100.0,
-                height_mm: 100.0,
-                items: vec![Item {
-                    path: img_path,
-                    x_mm: 0.0,
-                    y_mm: 0.0,
-                    rotation: 0.0,
-                    art_x_mm: 0.0,
-                    art_y_mm: 0.0,
-                    art_w_mm: 50.8,
-                    art_h_mm: 50.8,
-                }],
-            }],
-            None,
-        )
-        .unwrap();
+        // 600 px at 50.8 mm is exactly 300 dpi, so nothing has to be rescaled.
+        export(&dest, &[photo_page(&img_path, 50.8)], None).unwrap();
 
-        let bytes = fs::read(&dest).unwrap();
-        let text = String::from_utf8_lossy(&bytes);
+        let pdf = fs::read(&dest).unwrap();
+        assert!(String::from_utf8_lossy(&pdf).contains("/Filter /DCTDecode"));
+        assert!(
+            pdf.windows(source.len()).any(|window| window == source),
+            "the photo must travel untouched"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reencodes_a_jpeg_that_has_to_be_rescaled() {
+        let dir = temp_dir("jpeg-small");
+        let img_path = dir.join("foto.jpg");
+        noisy_jpeg(&img_path, 1200);
+        let source = fs::read(&img_path).unwrap();
+
+        let dest = dir.join("foto.pdf");
+        export(&dest, &[photo_page(&img_path, 25.4)], None).unwrap();
+
+        let pdf = fs::read(&dest).unwrap();
+        let text = String::from_utf8_lossy(&pdf);
         assert!(text.contains("/Filter /DCTDecode"));
-        assert!(!text.contains("/Filter /FlateDecode /Length"), "the photo must not be stored as Flate");
+        // 25.4 mm at 300 dpi needs 300 px, so the pixels were redrawn.
+        assert!(text.contains("/Width 300 /Height 300"));
+        assert!(!pdf.windows(source.len()).any(|window| window == source));
         let _ = fs::remove_dir_all(&dir);
     }
 

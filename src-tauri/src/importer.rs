@@ -9,8 +9,6 @@ pub const TRIM_ALPHA: u8 = 8;
 
 pub struct Probe {
     pub kind: &'static str,
-    /// The stored file lost empty margins on the way in.
-    pub trimmed: bool,
     pub width_px: f64,
     pub height_px: f64,
     pub width_mm: f64,
@@ -288,7 +286,6 @@ pub fn probe(src: &Path, ext: &str, thumbs: &Path, id: &str) -> Result<Probe, St
         })?;
         return Ok(Probe {
             kind: "vector",
-            trimmed: false,
             width_px: 0.0,
             height_px: 0.0,
             width_mm: round2(w),
@@ -305,13 +302,11 @@ pub fn probe(src: &Path, ext: &str, thumbs: &Path, id: &str) -> Result<Probe, St
     let has_alpha = loaded.color().has_alpha();
     // Transparent margins are not part of the sticker: cropping them here
     // makes every sheet denser without touching the nester.
-    let trimmed_img = if ext == "png" && has_alpha {
-        trim_margins(&loaded, src)
+    let img = if ext == "png" && has_alpha {
+        trim_margins(&loaded, src).unwrap_or(loaded)
     } else {
-        None
+        loaded
     };
-    let trimmed = trimmed_img.is_some();
-    let img = trimmed_img.unwrap_or(loaded);
     let (w, h) = img.dimensions();
     if w == 0 || h == 0 {
         return Err("La imagen está vacía".into());
@@ -320,7 +315,13 @@ pub fn probe(src: &Path, ext: &str, thumbs: &Path, id: &str) -> Result<Probe, St
     // fallback for artwork that carries no physical size at all.
     let dpi = declared_dpi(&bytes, ext).map(sane_dpi).unwrap_or(300.0);
 
-    let thumb = img.thumbnail(THUMB_MAX, THUMB_MAX);
+    // `thumbnail` also scales up, which would blow a small sticker's preview
+    // past its own pixels: only the ones that are too big shrink.
+    let thumb = if w > THUMB_MAX || h > THUMB_MAX {
+        img.thumbnail(THUMB_MAX, THUMB_MAX)
+    } else {
+        img
+    };
     let thumb_ext = if has_alpha { "png" } else { "jpg" };
     let thumb_path = thumbs.join(format!("{id}.{thumb_ext}"));
     let saved = if has_alpha {
@@ -332,7 +333,6 @@ pub fn probe(src: &Path, ext: &str, thumbs: &Path, id: &str) -> Result<Probe, St
 
     Ok(Probe {
         kind: "raster",
-        trimmed,
         width_px: w as f64,
         height_px: h as f64,
         width_mm: round2(w as f64 * 25.4 / dpi),
@@ -522,7 +522,8 @@ mod tests {
     #[test]
     fn trims_the_transparent_margins_of_a_png() {
         let dir = std::env::temp_dir().join(format!("sns-trim-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let thumbs = dir.join("thumbs");
+        std::fs::create_dir_all(&thumbs).unwrap();
         let path = dir.join("margen.png");
         let mut img = image::RgbaImage::from_pixel(20, 20, image::Rgba([0, 0, 0, 0]));
         for y in 5..15 {
@@ -531,23 +532,51 @@ mod tests {
             }
         }
         img.save(&path).unwrap();
+        let original = std::fs::read(&path).unwrap();
 
-        let trimmed_probe = probe(&path, "png", &dir, "recorte").unwrap();
-        assert!(trimmed_probe.trimmed);
+        let trimmed_probe = probe(&path, "png", &thumbs, "recorte").unwrap();
         assert!((trimmed_probe.width_px - 10.0).abs() < 1e-6);
         assert!((trimmed_probe.height_px - 10.0).abs() < 1e-6);
         // The stored copy lost the border too, so the PDF sees the same artwork.
         let stored = image::open(&path).unwrap();
         assert_eq!((stored.width(), stored.height()), (10, 10));
+        assert_ne!(std::fs::read(&path).unwrap(), original);
 
         // Artwork that fills its canvas is left exactly as it came.
         let full = dir.join("lleno.png");
         image::RgbaImage::from_pixel(12, 12, image::Rgba([0, 0, 255, 255]))
             .save(&full)
             .unwrap();
-        let untouched = probe(&full, "png", &dir, "lleno").unwrap();
-        assert!(!untouched.trimmed);
+        let before = std::fs::read(&full).unwrap();
+        let untouched = probe(&full, "png", &thumbs, "lleno").unwrap();
         assert!((untouched.width_px - 12.0).abs() < 1e-6);
+        assert_eq!(std::fs::read(&full).unwrap(), before);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_thumbnail_never_grows_a_small_image() {
+        let dir = std::env::temp_dir().join(format!("sns-thumb-{}", uuid::Uuid::new_v4()));
+        let thumbs = dir.join("thumbs");
+        std::fs::create_dir_all(&thumbs).unwrap();
+
+        let small = dir.join("pequeno.png");
+        image::RgbaImage::from_pixel(12, 12, image::Rgba([10, 20, 30, 255]))
+            .save(&small)
+            .unwrap();
+        probe(&small, "png", &thumbs, "pequeno").unwrap();
+        let thumb = image::open(thumbs.join("pequeno.png")).unwrap();
+        assert_eq!((thumb.width(), thumb.height()), (12, 12));
+
+        // Artwork over the limit still comes down to it.
+        let big = dir.join("grande.png");
+        image::RgbaImage::from_pixel(900, 600, image::Rgba([40, 50, 60, 255]))
+            .save(&big)
+            .unwrap();
+        probe(&big, "png", &thumbs, "grande").unwrap();
+        let thumb = image::open(thumbs.join("grande.png")).unwrap();
+        assert_eq!((thumb.width(), thumb.height()), (THUMB_MAX, 280));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

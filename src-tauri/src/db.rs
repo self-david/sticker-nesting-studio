@@ -413,8 +413,6 @@ pub fn insert(conn: &Connection, s: &NewSticker<'_>) -> rusqlite::Result<()> {
 
 /// What an import needs to know about the library to spot a repeat.
 pub struct KnownFile {
-    pub id: String,
-    pub name: String,
     pub hash: String,
     pub ext: String,
     pub size_bytes: i64,
@@ -422,16 +420,14 @@ pub struct KnownFile {
 
 pub fn known_files(conn: &Connection) -> Result<Vec<KnownFile>, String> {
     let mut stmt = conn
-        .prepare("SELECT id, name, hash, ext, size_bytes FROM stickers")
+        .prepare("SELECT hash, ext, size_bytes FROM stickers")
         .map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map([], |r| {
             Ok(KnownFile {
-                id: r.get(0)?,
-                name: r.get(1)?,
-                hash: r.get(2)?,
-                ext: r.get(3)?,
-                size_bytes: r.get(4)?,
+                hash: r.get(0)?,
+                ext: r.get(1)?,
+                size_bytes: r.get(2)?,
             })
         })
         .map_err(|e| e.to_string())?;

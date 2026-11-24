@@ -255,7 +255,7 @@ export default function App() {
     async (paths: string[], allowDuplicates = false) => {
       if (!paths.length || !isTauri) return;
       setImporting(true);
-      setImportProgress({ done: 0, total: paths.length, name: "" });
+      setImportProgress({ done: 0, total: paths.length });
       // Without the event bridge the import still runs; it just shows no ticks.
       const stop = await onImportProgress(setImportProgress).catch(() => () => {});
       try {
@@ -267,15 +267,11 @@ export default function App() {
             t("import.duplicatesAsk", { n: report.duplicates.length }),
           );
           if (again) {
-            const second = await importPaths(
-              report.duplicates.map((duplicate) => duplicate.path),
-              true,
-            );
+            const second = await importPaths(report.duplicates, true);
             report = {
+              ...report,
               importedIds: [...report.importedIds, ...second.importedIds],
               errors: [...report.errors, ...second.errors],
-              duplicates: second.duplicates,
-              cancelled: second.cancelled,
             };
           }
         }

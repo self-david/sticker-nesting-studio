@@ -9,7 +9,7 @@ mod project;
 
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -36,21 +36,13 @@ struct ImportFailure {
     message: String,
 }
 
-/// A file the library already holds, reported instead of copied twice.
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ImportDuplicate {
-    path: String,
-    name: String,
-    existing_id: String,
-}
-
 #[derive(Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct ImportReport {
     imported_ids: Vec<String>,
     errors: Vec<ImportFailure>,
-    duplicates: Vec<ImportDuplicate>,
+    /// Paths of files the library already held, left out unless asked twice.
+    duplicates: Vec<String>,
     cancelled: bool,
 }
 
@@ -62,43 +54,42 @@ struct LibraryInfo {
     bytes: i64,
 }
 
-#[derive(Clone, Serialize)]
+/// Progress of an import: one event per file.
+#[derive(Clone, Copy, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ImportProgress {
     done: usize,
     total: usize,
-    name: String,
 }
 
 /// What the library already has, so a repeat costs no copy and no row.
 /// Rows imported before the hash column existed fall back to extension plus
 /// byte size, which is only ever a question to the user, never a silent skip.
 struct KnownIndex {
-    by_hash: HashMap<String, (String, String)>,
-    by_size: HashMap<String, (String, String)>,
+    hashes: HashSet<String>,
+    legacy: HashSet<String>,
 }
 
 impl KnownIndex {
     fn build(files: Vec<db::KnownFile>) -> Self {
-        let mut by_hash = HashMap::new();
-        let mut by_size = HashMap::new();
+        let mut hashes = HashSet::new();
+        let mut legacy = HashSet::new();
         for file in files {
             if file.hash.is_empty() {
-                by_size.insert(legacy_key(&file.ext, file.size_bytes), (file.id, file.name));
+                legacy.insert(legacy_key(&file.ext, file.size_bytes));
             } else {
-                by_hash.insert(file.hash, (file.id, file.name));
+                hashes.insert(file.hash);
             }
         }
-        KnownIndex { by_hash, by_size }
+        KnownIndex { hashes, legacy }
     }
 
-    fn find(&self, hash: &str, size: &str) -> Option<&(String, String)> {
-        self.by_hash.get(hash).or_else(|| self.by_size.get(size))
+    fn holds(&self, hash: &str, size: &str) -> bool {
+        self.hashes.contains(hash) || self.legacy.contains(size)
     }
 
-    fn remember(&mut self, hash: &str, id: &str, name: &str) {
-        self.by_hash
-            .insert(hash.to_string(), (id.to_string(), name.to_string()));
+    fn remember(&mut self, hash: &str) {
+        self.hashes.insert(hash.to_string());
     }
 }
 
@@ -121,7 +112,7 @@ struct Prepared {
 
 struct Batch {
     prepared: Vec<Prepared>,
-    duplicates: Vec<ImportDuplicate>,
+    duplicates: Vec<String>,
     errors: Vec<ImportFailure>,
     cancelled: bool,
 }
@@ -153,16 +144,11 @@ fn prepare_batch(
             break;
         }
         let src = PathBuf::from(&raw);
-        let name = src
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| raw.clone());
         let _ = app.emit(
             "import:progress",
             ImportProgress {
                 done: index,
                 total,
-                name: name.clone(),
             },
         );
 
@@ -200,15 +186,9 @@ fn prepare_batch(
         // The size read here is the source file's, which is what a row from
         // before the hash column recorded.
         let size = legacy_key(&ext, bytes.len() as i64);
-        if !allow_duplicates {
-            if let Some((existing_id, stored_name)) = known.find(&hash, &size) {
-                batch.duplicates.push(ImportDuplicate {
-                    path: raw,
-                    name: stored_name.clone(),
-                    existing_id: existing_id.clone(),
-                });
-                continue;
-            }
+        if !allow_duplicates && known.holds(&hash, &size) {
+            batch.duplicates.push(raw);
+            continue;
         }
 
         let id = uuid::Uuid::new_v4().to_string();
@@ -233,7 +213,7 @@ fn prepare_batch(
                     .file_name()
                     .map(|s| s.to_string_lossy().to_string())
                     .unwrap_or_default();
-                known.remember(&hash, &id, &clean);
+                known.remember(&hash);
                 batch.prepared.push(Prepared {
                     id,
                     source: raw,
@@ -255,18 +235,11 @@ fn prepare_batch(
         }
     }
 
-    let _ = app.emit(
-        "import:progress",
-        ImportProgress {
-            done: if batch.cancelled {
-                batch.prepared.len() + batch.duplicates.len() + batch.errors.len()
-            } else {
-                total
-            },
-            total,
-            name: String::new(),
-        },
-    );
+    // A cancelled batch never reaches the last file on its own.
+    if batch.cancelled {
+        let done = batch.prepared.len() + batch.duplicates.len() + batch.errors.len();
+        let _ = app.emit("import:progress", ImportProgress { done, total });
+    }
     batch
 }
 
@@ -312,10 +285,10 @@ async fn import_paths(
 
     let mut report = ImportReport {
         duplicates: batch.duplicates,
+        errors: batch.errors,
         cancelled: batch.cancelled,
         ..ImportReport::default()
     };
-    report.errors.extend(batch.errors);
     if batch.prepared.is_empty() {
         return Ok(report);
     }
@@ -1142,10 +1115,8 @@ fn reveal_library(state: State<'_, AppState>) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    fn known(hash: &str, id: &str, ext: &str, bytes: i64) -> db::KnownFile {
+    fn known(hash: &str, ext: &str, bytes: i64) -> db::KnownFile {
         db::KnownFile {
-            id: id.to_string(),
-            name: format!("nombre-{id}"),
             hash: hash.to_string(),
             ext: ext.to_string(),
             size_bytes: bytes,
@@ -1154,20 +1125,12 @@ mod tests {
 
     #[test]
     fn a_repeat_is_found_by_hash_and_old_rows_by_size() {
-        let index = KnownIndex::build(vec![
-            known("abc", "nuevo", "png", 10),
-            known("", "viejo", "JPG", 20),
-        ]);
+        let index = KnownIndex::build(vec![known("abc", "png", 10), known("", "JPG", 20)]);
 
-        let by_hash = index.find("abc", "png|999").expect("same bytes");
-        assert_eq!(by_hash.0, "nuevo");
-        assert_eq!(by_hash.1, "nombre-nuevo");
-
+        assert!(index.holds("abc", "png|999"), "same bytes, other size key");
         // A row from before the hash existed: extension and byte size match.
-        let by_size = index.find("otro", &legacy_key("jpg", 20)).expect("old row");
-        assert_eq!(by_size.0, "viejo");
-
-        assert!(index.find("desconocido", &legacy_key("png", 1)).is_none());
+        assert!(index.holds("otro", &legacy_key("jpg", 20)));
+        assert!(!index.holds("desconocido", &legacy_key("png", 1)));
     }
 
     #[test]
