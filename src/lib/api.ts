@@ -205,6 +205,14 @@ export function aiReorderKeys(ids: string[]): Promise<AiStatus> {
   return invoke<AiStatus>("ai_reorder_keys", { ids });
 }
 
+/** Saves the models in ai.json; an empty name restores its built-in default. */
+export function aiSetModels(patch: { model?: string; textModel?: string }): Promise<AiStatus> {
+  return invoke<AiStatus>("ai_set_models", {
+    model: patch.model ?? null,
+    textModel: patch.textModel ?? null,
+  });
+}
+
 /** A single cheap request, so one key can be checked on its own. */
 export function aiTestKey(id: string): Promise<AiKeyCheck> {
   return invoke<AiKeyCheck>("ai_test_key", { id });

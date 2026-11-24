@@ -248,6 +248,34 @@ pub fn load(root: &Path) -> Option<(Vec<StoredKey>, String, String)> {
     }
 }
 
+/// A chosen model name, or the built-in one when the caller left it empty: an
+/// empty string is a request for the default, never a model to ask for.
+fn chosen_model(raw: &str, default: &str) -> String {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        default.to_string()
+    } else {
+        raw.to_string()
+    }
+}
+
+/// Saves the two models, each one only when it is given.
+pub fn set_models(
+    root: &Path,
+    model: Option<&str>,
+    text_model: Option<&str>,
+) -> Result<AiStatus, String> {
+    let mut store = read_store(root);
+    if let Some(model) = model {
+        store.model = chosen_model(model, DEFAULT_MODEL);
+    }
+    if let Some(text_model) = text_model {
+        store.text_model = chosen_model(text_model, TEXT_MODEL);
+    }
+    write_store(root, &store)?;
+    Ok(status(root))
+}
+
 fn hint_of(key: &str) -> String {
     let tail: String = key
         .chars()
@@ -1129,6 +1157,32 @@ mod tests {
             clean_texto(&"x".repeat(300)).unwrap().chars().count(),
             MAX_TEXTO_CHARS
         );
+    }
+
+    #[test]
+    fn either_model_can_be_replaced_and_cleared() {
+        let dir = temp_dir("set-models");
+        let both = set_models(&dir, Some(" vision/x "), Some("text/y")).unwrap();
+        assert_eq!(both.model, "vision/x");
+        assert_eq!(both.text_model, "text/y");
+
+        // Only the model given changes; the other one keeps its name.
+        let vision_only = set_models(&dir, Some("vision/z"), None).unwrap();
+        assert_eq!(vision_only.model, "vision/z");
+        assert_eq!(vision_only.text_model, "text/y");
+
+        // An empty name is not a model: it returns the role to its default.
+        let cleared = set_models(&dir, Some("  "), Some("")).unwrap();
+        assert_eq!(cleared.model, DEFAULT_MODEL);
+        assert_eq!(cleared.text_model, TEXT_MODEL);
+
+        // The choice is in ai.json, so it survives a reload.
+        let saved: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(config_path(&dir)).unwrap()).unwrap();
+        assert_eq!(saved["model"], DEFAULT_MODEL);
+        assert_eq!(saved["textModel"], TEXT_MODEL);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

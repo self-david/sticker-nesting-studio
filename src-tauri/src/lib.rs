@@ -567,6 +567,16 @@ fn ai_reorder_keys(
     ai::reorder_keys(&state.root, &ids)
 }
 
+/// Saves either model in `ai.json`; an empty name restores its default.
+#[tauri::command]
+fn ai_set_models(
+    state: State<'_, AppState>,
+    model: Option<String>,
+    text_model: Option<String>,
+) -> Result<ai::AiStatus, String> {
+    ai::set_models(&state.root, model.as_deref(), text_model.as_deref())
+}
+
 /// Names and tags the given stickers from their thumbnails. The caller decides
 /// the ids, so the same command serves both the bulk run and one sticker.
 /// `fresh` skips the cache: redoing one sticker on purpose always asks again,
@@ -1334,6 +1344,7 @@ pub fn run() {
             ai_update_key,
             ai_remove_key,
             ai_reorder_keys,
+            ai_set_models,
             ai_describe,
             ai_classify,
             ai_normalize_tags,

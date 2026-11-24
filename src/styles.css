@@ -2101,6 +2101,17 @@ button {
   cursor: default;
 }
 
+.ai-model-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 8px;
+}
+
+.ai-model-grid .text-input {
+  height: 30px;
+  font-size: 12.5px;
+}
+
 .ai-key-add {
   display: grid;
   grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr) auto;

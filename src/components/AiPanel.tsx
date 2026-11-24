@@ -5,6 +5,7 @@ import {
   aiDescribe,
   aiRemoveKey,
   aiReorderKeys,
+  aiSetModels,
   aiStatus,
   aiTagSuggestions,
   aiTestKey,
@@ -124,6 +125,51 @@ function KeyRow({
         </button>
       </div>
     </li>
+  );
+}
+
+interface ModelFieldProps {
+  label: string;
+  /** The name saved in ai.json: the source of truth for the input. */
+  value: string;
+  disabled: boolean;
+  /** Resolves `true` when the new name was stored; `false` puts the old one back. */
+  onSave: (value: string) => Promise<boolean>;
+}
+
+function ModelField({ label, value, disabled, onSave }: ModelFieldProps) {
+  const [draft, setDraft] = useState(value);
+
+  useEffect(() => {
+    setDraft(value);
+  }, [value]);
+
+  // Empty is a valid choice: Rust puts that role back on its default model.
+  const commit = async () => {
+    const next = draft.trim();
+    if (next === value) {
+      setDraft(value);
+      return;
+    }
+    if (!(await onSave(next))) setDraft(value);
+  };
+
+  return (
+    <label className="field">
+      <span className="field-label">{label}</span>
+      <input
+        className="text-input"
+        value={draft}
+        disabled={disabled}
+        spellCheck={false}
+        autoComplete="off"
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={() => void commit()}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+        }}
+      />
+    </label>
   );
 }
 
@@ -279,6 +325,22 @@ export function AiPanel({
     }
   };
 
+  // One request per field, and the answer is the whole saved state, so a failure
+  // leaves the input on the name that is really in ai.json.
+  const saveModel = async (field: "model" | "textModel", value: string) => {
+    setBusyKey(true);
+    setKeyError(null);
+    try {
+      applyStatus(await aiSetModels({ [field]: value }));
+      return true;
+    } catch (err) {
+      setKeyError(String(err));
+      return false;
+    } finally {
+      setBusyKey(false);
+    }
+  };
+
   // One sticker at a time; each request takes the next key in the list.
   const run = async () => {
     if (!configured || !pending.length || running) return;
@@ -351,6 +413,8 @@ export function AiPanel({
         </header>
 
         <div className="ai-body">
+          {keyError && <span className="err">{keyError}</span>}
+
           <section className="ai-field">
           <div className="ai-field-head">
             <span className="field-label">
@@ -414,9 +478,30 @@ export function AiPanel({
               + {t("ai.keyAdd")}
             </button>
           </div>
-
-            {keyError && <span className="err">{keyError}</span>}
           </section>
+
+          {status !== null && (
+            <section className="ai-field">
+              <div className="ai-field-head">
+                <span className="field-label">{t("ai.modelsTitle")}</span>
+              </div>
+              <span className="muted small">{t("ai.modelsNote")}</span>
+              <div className="ai-model-grid">
+                <ModelField
+                  label={t("ai.visionModel")}
+                  value={status.model}
+                  disabled={locked}
+                  onSave={(value) => saveModel("model", value)}
+                />
+                <ModelField
+                  label={t("ai.textModel")}
+                  value={status.textModel}
+                  disabled={locked}
+                  onSave={(value) => saveModel("textModel", value)}
+                />
+              </div>
+            </section>
+          )}
 
           {(running || summary) && (
             <section className="ai-progress-box">
@@ -453,9 +538,6 @@ export function AiPanel({
               <span className="field-label">{t("ai.classifyTitle")}</span>
             </div>
             <span className="muted small">{t("ai.classifyNote")}</span>
-            <span className="muted small">
-              {t("ai.classifyModel", { model: status?.textModel ?? "openai/gpt-oss-20b" })}
-            </span>
             <button
               className="ghost-btn"
               onClick={() => void classify()}
