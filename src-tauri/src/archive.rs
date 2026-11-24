@@ -50,6 +50,9 @@ pub struct ArchiveSticker {
     pub ai_at: i64,
     #[serde(default)]
     pub classified_at: i64,
+    /// Printed text read by the AI. Optional: older archives have none.
+    #[serde(default)]
+    pub texto: String,
     #[serde(default)]
     pub tags: Vec<String>,
 }
@@ -231,6 +234,7 @@ pub fn export(root: &Path, stickers: &[Sticker], destination: &Path) -> Result<P
                 tipo: sticker.tipo.clone(),
                 ai_at: sticker.ai_at,
                 classified_at: sticker.classified_at,
+                texto: sticker.texto.clone(),
                 tags: sticker.tags.clone(),
             });
         }
@@ -438,6 +442,7 @@ pub fn store(
         serie: plan.sticker.serie.trim().to_string(),
         tipo: plan.sticker.tipo.trim().to_string(),
         classified_at: plan.sticker.classified_at,
+        texto: plan.sticker.texto.trim().to_string(),
         tags: plan.sticker.tags.clone(),
     };
     if sticker.name.is_empty() {

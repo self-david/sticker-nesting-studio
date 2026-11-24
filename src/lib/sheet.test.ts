@@ -100,6 +100,7 @@ const sticker = (widthMm = 40, heightMm = 20): Sticker => ({
   tipo: "",
   aiAt: 0,
   classifiedAt: 0,
+  texto: "",
 });
 
 describe("copiesFromSticker", () => {

@@ -1189,7 +1189,7 @@ export default function App() {
           series={series}
           busy={merging}
           onClose={() => setSeriesOpen(false)}
-          onMerge={(from, into) => void mergeInto(from, into)}
+          onMerge={mergeInto}
         />
       )}
 

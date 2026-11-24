@@ -31,8 +31,26 @@ function sticker(name: string, tags: string[], serie = "", tipo = ""): Sticker {
     tipo,
     aiAt: 0,
     classifiedAt: 0,
+    texto: "",
   };
 }
+
+describe("texto impreso (OCR)", () => {
+  test("una palabra del texto encuentra el sticker", () => {
+    const tarta = {
+      ...sticker("Tarta", ["postre"]),
+      texto: "FELIZ CUMPLEAÑOS, LUCÍA",
+    };
+    expect(stickerMatches(tarta, parseQuery("lucía"))).toBe(true);
+    expect(filterStickers([tarta], parseQuery("feliz"))).toEqual([tarta]);
+    expect(stickerMatches(tarta, parseQuery("globos"))).toBe(false);
+  });
+
+  test("el texto impreso también perdona una errata", () => {
+    const tarta = { ...sticker("Tarta", []), texto: "feliz cumpleaños" };
+    expect(stickerMatches(tarta, parseQuery("cumpleanios"))).toBe(true);
+  });
+});
 
 const kitty = sticker("Hello Kitty con corona", ["personaje", "sanrio", "gato", "corazón"]);
 const tiger = sticker("Cachorro de tigre", ["animal", "tigre", "disney"]);

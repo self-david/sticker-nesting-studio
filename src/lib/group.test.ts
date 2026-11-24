@@ -24,6 +24,7 @@ function sticker(name: string, serie: string, tipo: string): Sticker {
     tipo,
     aiAt: 0,
     classifiedAt: 1,
+    texto: "",
   };
 }
 

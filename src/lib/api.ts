@@ -10,6 +10,7 @@ import type {
   ImportReport,
   LibraryInfo,
   SortKey,
+  MergeGroup,
   Sticker,
   TagCount,
 } from "../types";
@@ -80,6 +81,21 @@ export function setStickersClassification(
 /** Every sticker of `from` ends up under `into`; returns how many moved. */
 export function mergeSeries(from: string[], into: string): Promise<number> {
   return invoke<number>("merge_series", { from, into });
+}
+
+/** Text-only pass: which tags in the library mean the same. Writes nothing. */
+export function aiTagSuggestions(): Promise<MergeGroup[]> {
+  return invoke<MergeGroup[]>("ai_normalize_tags");
+}
+
+/** Text-only pass: which series names are the same work. Writes nothing. */
+export function aiSeriesSuggestions(): Promise<MergeGroup[]> {
+  return invoke<MergeGroup[]>("ai_series_suggestions");
+}
+
+/** Folds every sticker tagged with `from` into `into`; returns how many changed. */
+export function mergeTags(from: string[], into: string): Promise<number> {
+  return invoke<number>("merge_tags", { from, into });
 }
 
 /** One sticker of the archive that already exists here. */

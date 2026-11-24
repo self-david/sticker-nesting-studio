@@ -25,6 +25,8 @@ export interface Sticker {
   aiAt: number;
   /** When the text classifier filled serie and tipo (0 = never). */
   classifiedAt: number;
+  /** Words printed on the artwork, as the AI read them ("" = none). */
+  texto: string;
 }
 
 export interface TagCount {
@@ -74,7 +76,10 @@ export interface AiKeyInfo {
 export interface AiStatus {
   /** In execution order: the first one is used first. */
   keys: AiKeyInfo[];
+  /** The vision model: names and tags from the artwork. */
   model: string;
+  /** The text model used to classify series and types. */
+  textModel: string;
 }
 
 export interface AiKeyCheck {
@@ -88,6 +93,12 @@ export interface AiKeyCheck {
 export interface AiFailure {
   id: string;
   message: string;
+}
+
+/** One canonical name (a tag, a series) and the spellings to fold into it. */
+export interface MergeGroup {
+  canonico: string;
+  variantes: string[];
 }
 
 export interface AiReport {

@@ -8,9 +8,13 @@ use std::time::Duration;
 
 /// Groq's vision model: the cheapest one in the catalogue that reads images.
 pub const DEFAULT_MODEL: &str = "qwen/qwen3.8-27b";
+/// Reading names, series and types needs no eyes. A small text model costs about
+/// a tenth of the vision one per token, so classification has its own model.
+pub const TEXT_MODEL: &str = "openai/gpt-oss-20b";
 const ENDPOINT: &str = "https://api.groq.com/openai/v1/chat/completions";
 const MAX_NAME_CHARS: usize = 60;
 const MAX_SERIE_CHARS: usize = 60;
+const MAX_TEXTO_CHARS: usize = 200;
 const MAX_KEY_NAME_CHARS: usize = 40;
 
 /// The closed list of families a sticker can belong to. A model answer outside
@@ -37,8 +41,10 @@ const PROMPT: &str = "Mira este sticker.\n\
 Si reconoces a un personaje conocido (película, serie, anime, videojuego, cómic), nómbralo con su nombre propio \
 («Sombrerero loco», «Hello Kitty», «Pikachu») y pon la obra entre las etiquetas.\n\
 Si no lo reconoces, describe lo que se ve.\n\
-Devuelve SOLO este JSON: {\"name\": \"...\", \"serie\": \"...\", \"tipo\": \"...\", \"tags\": [\"...\"]}.\n\
+Devuelve SOLO este JSON: {\"name\": \"...\", \"serie\": \"...\", \"tipo\": \"...\", \"tags\": [\"...\"], \"texto\": \"...\"}.\n\
 - name: de 2 a 5 palabras en español. Personaje reconocido: su nombre. Si no, qué se ve. Sin comillas ni emojis.\n\
+- texto: si la imagen lleva texto impreso, cópialo tal cual, en una sola línea y sin comillas; cadena vacía si no hay. \
+Si el sticker es sobre todo tipografía, usa ese texto como name.\n\
 - serie: la obra o franquicia a la que pertenece (película, serie, anime, videojuego, cómic), con su forma más conocida. \
 Cadena vacía si no la reconoces con seguridad; no la inventes.\n\
 - tipo: exactamente uno de: anime, comic, cartoon, videojuego, cine, terror, fantasia, kawaii, cotidiano, frase, otros.\n\
@@ -67,7 +73,10 @@ pub struct KeyInfo {
 pub struct AiStatus {
     /// In execution order: the first one is used first.
     pub keys: Vec<KeyInfo>,
+    /// The vision model: names and tags from the artwork.
     pub model: String,
+    /// The text model: series and types from names and tags only.
+    pub text_model: String,
 }
 
 /// Result of checking one key on its own.
@@ -95,6 +104,8 @@ struct Store {
     keys: Vec<StoredKey>,
     #[serde(default)]
     model: String,
+    #[serde(default)]
+    text_model: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -109,6 +120,9 @@ pub struct Answer {
     pub tipo: String,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Words printed on the artwork, as the model read them ("" = none).
+    #[serde(default)]
+    pub texto: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -150,12 +164,14 @@ fn read_store(root: &Path) -> Store {
         return Store {
             keys: Vec::new(),
             model: DEFAULT_MODEL.to_string(),
+            text_model: TEXT_MODEL.to_string(),
         };
     };
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
         return Store {
             keys: Vec::new(),
             model: DEFAULT_MODEL.to_string(),
+            text_model: TEXT_MODEL.to_string(),
         };
     };
 
@@ -173,6 +189,11 @@ fn read_store(root: &Path) -> Store {
                 .and_then(|m| m.as_str())
                 .unwrap_or(DEFAULT_MODEL)
                 .to_string(),
+            text_model: value
+                .get("textModel")
+                .and_then(|m| m.as_str())
+                .unwrap_or(TEXT_MODEL)
+                .to_string(),
         }
     } else {
         Store::default()
@@ -184,6 +205,10 @@ fn read_store(root: &Path) -> Store {
     }
     if store.model.trim().is_empty() {
         store.model = DEFAULT_MODEL.to_string();
+    }
+    // Libraries saved before the split keep the vision model and gain the text one.
+    if store.text_model.trim().is_empty() {
+        store.text_model = TEXT_MODEL.to_string();
     }
     store
 }
@@ -206,16 +231,18 @@ pub fn status(root: &Path) -> AiStatus {
             })
             .collect(),
         model: store.model,
+        text_model: store.text_model,
     }
 }
 
-/// The keys in execution order, for the requests themselves.
-pub fn load(root: &Path) -> Option<(Vec<StoredKey>, String)> {
+/// The keys in execution order and both models: the vision one for the artwork,
+/// the text one for classification.
+pub fn load(root: &Path) -> Option<(Vec<StoredKey>, String, String)> {
     let store = read_store(root);
     if store.keys.is_empty() {
         None
     } else {
-        Some((store.keys, store.model))
+        Some((store.keys, store.model, store.text_model))
     }
 }
 
@@ -431,6 +458,7 @@ pub fn answer_from(raw: &str) -> Result<Answer, String> {
         serie: clean_serie(&answer.serie).unwrap_or_default(),
         tipo: clean_tipo(&answer.tipo),
         tags: answer.tags,
+        texto: clean_texto(&answer.texto).unwrap_or_default(),
     })
 }
 
@@ -540,6 +568,148 @@ pub fn parse_classifications(
         });
     }
     Ok(out)
+}
+
+// ---------- one vocabulary, without reading a single image ----------
+
+/// Both passes answer with a short list of groups.
+pub const SUGGEST_MAX_TOKENS: u32 = 1024;
+pub const TAGS_SYSTEM: &str = "Eres un catalogador de pegatinas para una biblioteca \
+personal. Unificas el vocabulario de las etiquetas: agrupas las que significan lo mismo y eliges \
+la forma más clara en español. Respondes solo con JSON válido.";
+
+/// One canonical name (a tag, a series) and the spellings it absorbs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergeGroup {
+    pub canonico: String,
+    pub variantes: Vec<String>,
+}
+
+const TAG_RULES: &str = "Estas son todas las etiquetas de la biblioteca de stickers.\n\
+Agrupa SOLO las que signifiquen lo mismo en este catálogo: sinónimos («perro» / «can»), \
+plurales («perritos» / «perro»), diminutivos, erratas y variantes de escritura.\n\
+No agrupes por parecido vago ni por tema: «gato» y «perro» son animales, no sinónimos.\n\
+El campo canonico debe ser EXACTAMENTE una de las etiquetas de la lista: la forma más general \
+y clara. Las variantes son las demás etiquetas de la lista que deben pasar a esa.\n\
+Si una etiqueta no tiene sinónimos, no la devuelvas.\n\nEtiquetas:";
+
+/// The user content for either pass: the rules, the whole list and the shape of
+/// the answer. Only the rules change between tags and series.
+fn vocabulary_content(rules: &str, names: &[String]) -> serde_json::Value {
+    let mut text = String::from(rules);
+    for name in names {
+        text.push_str("\n- ");
+        text.push_str(name);
+    }
+    text.push_str(
+        "\n\nDevuelve SOLO este JSON: {\"grupos\":[{\"canonico\":\"...\",\"variantes\":[\"...\"]}]}",
+    );
+    serde_json::json!([{ "type": "text", "text": text }])
+}
+
+pub fn tags_content(tags: &[String]) -> serde_json::Value {
+    vocabulary_content(TAG_RULES, tags)
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct WireTagGroup {
+    #[serde(default)]
+    canonico: String,
+    #[serde(default)]
+    variantes: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct WireTags {
+    #[serde(default)]
+    grupos: Vec<WireTagGroup>,
+}
+
+/// The stored spelling of a name the model gave, matched without case and, as a
+/// second chance, without diacritics. `None` when it is not in the library.
+fn real_name<'a>(known: &'a [String], raw: &str) -> Option<&'a String> {
+    let wanted = raw.trim().to_lowercase();
+    if let Some(found) = known.iter().find(|name| **name == wanted) {
+        return Some(found);
+    }
+    // «Pokémon» and «pokemon» are the same word but not the same spelling: the
+    // case-insensitive pass keeps the accented one when both exist.
+    if let Some(found) = known.iter().find(|name| name.to_lowercase() == wanted) {
+        return Some(found);
+    }
+    let folded = fold(&wanted);
+    known.iter().find(|name| fold(name) == folded)
+}
+
+/// Keeps only groups whose canonical form and variants already exist and each
+/// variant in one group only: the model may propose, never invent a name.
+pub fn parse_merge_groups(raw: &str, known: &[String]) -> Result<Vec<MergeGroup>, String> {
+    let trimmed = raw.trim();
+    let start = trimmed
+        .find('{')
+        .ok_or_else(|| "La IA no devolvió JSON".to_string())?;
+    let end = trimmed
+        .rfind('}')
+        .ok_or_else(|| "La IA no devolvió JSON".to_string())?;
+    if end <= start {
+        return Err("La IA no devolvió JSON".to_string());
+    }
+    let wire: WireTags = serde_json::from_str(&trimmed[start..=end])
+        .map_err(|e| format!("Respuesta ilegible de la IA: {e}"))?;
+
+    let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut groups = Vec::new();
+    for group in wire.grupos {
+        let Some(canonico) = real_name(known, &group.canonico) else {
+            continue;
+        };
+        if used.contains(canonico) {
+            continue;
+        }
+        let mut variantes: Vec<String> = Vec::new();
+        for raw in &group.variantes {
+            let Some(tag) = real_name(known, raw) else {
+                continue;
+            };
+            if tag == canonico || used.contains(tag) || variantes.contains(tag) {
+                continue;
+            }
+            variantes.push(tag.clone());
+        }
+        if variantes.is_empty() {
+            continue;
+        }
+        used.insert(canonico.clone());
+        for variante in &variantes {
+            used.insert(variante.clone());
+        }
+        groups.push(MergeGroup {
+            canonico: canonico.clone(),
+            variantes,
+        });
+    }
+    Ok(groups)
+}
+
+// ---------- series, one work under one spelling ----------
+
+pub const SERIES_SYSTEM: &str = "Eres un catalogador de pegatinas para una biblioteca \
+personal. Unificas los nombres de las obras y franquicias de las que salen los stickers. \
+Respondes solo con JSON válido.";
+
+const SERIES_RULES: &str = "Estas son todas las series de la biblioteca, de la más usada a la \
+menos usada.\n\
+Agrupa SOLO las que sean la misma obra escrita de distinta forma: mayúsculas, tildes, \
+erratas y el nombre corto frente al completo («Pokemon» / «Pokémon» / «Pókemon»).\n\
+No unas obras distintas, ni una saga con su secuela o su precuela («Toy Story» y \
+«Toy Story 2» son dos series diferentes).\n\
+El campo canonico debe ser EXACTAMENTE una de las series de la lista: la forma más usada \
+o la más conocida. Las variantes son las demás series de la lista que deben pasar a esa.\n\
+Si una serie no tiene variantes, no la devuelvas.\n\nSeries:";
+
+pub fn series_content(series: &[String]) -> serde_json::Value {
+    vocabulary_content(SERIES_RULES, series)
 }
 
 /// One cheap request (a single token, no image) to tell whether a key works.
@@ -679,6 +849,33 @@ fn fold(value: &str) -> String {
         })
         .collect();
     plain.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The printed text is kept on one line, without quotes, and short enough to be
+/// a column rather than a paragraph; `None` when the model read nothing.
+pub fn clean_texto(raw: &str) -> Option<String> {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let cleaned = cleaned
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_matches(|c| c == '"' || c == '\'' || c == '«' || c == '»')
+        .trim()
+        .to_string();
+    if cleaned.is_empty() {
+        return None;
+    }
+    Some(
+        cleaned
+            .chars()
+            .take(MAX_TEXTO_CHARS)
+            .collect::<String>()
+            .trim()
+            .to_string(),
+    )
 }
 
 /// The series is a plain canonical name: no quotes, no stray spaces, no control
@@ -881,7 +1078,7 @@ mod tests {
         let ids: Vec<String> = after_second.keys.iter().map(|k| k.id.clone()).collect();
         let flipped = reorder_keys(&dir, &[ids[1].clone(), ids[0].clone()]).unwrap();
         assert_eq!(flipped.keys[0].id, ids[1]);
-        let (keys, _) = load(&dir).unwrap();
+        let (keys, _, _) = load(&dir).unwrap();
         assert_eq!(keys[0].id, ids[1]);
 
         let renamed = update_key(&dir, &ids[1], Some("Personal"), None).unwrap();
@@ -907,5 +1104,118 @@ mod tests {
         assert_eq!(loaded.keys[0].name, "Clave 1");
         assert_eq!(loaded.keys[0].hint, "…ghij");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_vision_prompt_asks_for_the_printed_text() {
+        assert!(PROMPT.contains("\"texto\""), "el JSON no pide texto");
+        assert!(PROMPT.contains("texto impreso"), "falta la regla del OCR");
+        assert!(
+            PROMPT.contains("usa ese texto como name"),
+            "el OCR no mejora el nombre de un sticker tipográfico"
+        );
+    }
+
+    #[test]
+    fn the_printed_text_comes_back_clean_and_on_one_line() {
+        let raw = r#"{"name":"Tarta","tags":["postre"],"texto":"  «FELIZ\nCUMPLEAÑOS»  "}"#;
+        let answer = answer_from(raw).unwrap();
+        assert_eq!(answer.texto, "FELIZ CUMPLEAÑOS");
+        assert!(answer_from(r#"{"name":"Tarta"}"#).unwrap().texto.is_empty());
+        assert_eq!(clean_texto("   "), None);
+        assert_eq!(
+            clean_texto(&"x".repeat(300)).unwrap().chars().count(),
+            MAX_TEXTO_CHARS
+        );
+    }
+
+    #[test]
+    fn vision_and_text_models_have_their_own_defaults() {
+        let dir = temp_dir("models");
+        let fresh = status(&dir);
+        assert_eq!(fresh.model, DEFAULT_MODEL);
+        assert_eq!(fresh.text_model, TEXT_MODEL);
+
+        fs::write(
+            config_path(&dir),
+            r#"{"keys":[],"model":"vision/x","textModel":"text/y"}"#,
+        )
+        .unwrap();
+        let saved = status(&dir);
+        assert_eq!(saved.model, "vision/x");
+        assert_eq!(saved.text_model, "text/y");
+
+        // A store from before the split keeps its vision model and gains the text one.
+        fs::write(config_path(&dir), r#"{"keys":[],"model":"vision/x"}"#).unwrap();
+        assert_eq!(status(&dir).text_model, TEXT_MODEL);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn vocabulary() -> Vec<String> {
+        vec![
+            "perro".into(),
+            "perritos".into(),
+            "can".into(),
+            "gato".into(),
+            "pokemon".into(),
+            "pokémon".into(),
+        ]
+    }
+
+    #[test]
+    fn the_tag_prompt_lists_the_vocabulary_and_the_rules() {
+        let content = tags_content(&vocabulary());
+        let text = content[0]["text"].as_str().unwrap();
+        for tag in vocabulary() {
+            assert!(text.contains(&tag), "el prompt no menciona «{tag}»");
+        }
+        assert!(text.contains("canonico"), "el JSON no pide la forma canónica");
+        assert!(text.contains("\"grupos\""), "el JSON no pide grupos");
+        assert!(text.contains("No agrupes"), "falta el límite de los sinónimos");
+    }
+
+    #[test]
+    fn tag_groups_only_use_tags_that_exist_and_only_once() {
+        let raw = r#"{"grupos":[
+            {"canonico":"perro","variantes":["perritos","can","Perro","inventada"]},
+            {"canonico":"gato","variantes":["perritos"]},
+            {"canonico":"dragon","variantes":["gato"]},
+            {"canonico":"pokemon","variantes":["pokémon"]}
+        ]}"#;
+        let groups = parse_merge_groups(raw, &vocabulary()).unwrap();
+        assert_eq!(groups.len(), 2, "un grupo repetido o inventado se cuela");
+        assert_eq!(groups[0].canonico, "perro");
+        assert_eq!(groups[0].variantes, vec!["perritos", "can"]);
+        assert_eq!(groups[1].canonico, "pokemon");
+        assert_eq!(groups[1].variantes, vec!["pokémon"]);
+
+        // Nothing to merge is not an error.
+        assert!(parse_merge_groups(r#"{"grupos":[]}"#, &vocabulary())
+            .unwrap()
+            .is_empty());
+        assert!(parse_merge_groups("lo siento", &vocabulary()).is_err());
+    }
+
+    #[test]
+    fn the_series_prompt_carries_the_list_and_the_limits() {
+        let series = vec![
+            "Pokemon".to_string(),
+            "Pokémon".to_string(),
+            "Toy Story".to_string(),
+        ];
+        let content = series_content(&series);
+        let text = content[0]["text"].as_str().unwrap();
+        for serie in &series {
+            assert!(text.contains(serie), "el prompt no menciona «{serie}»");
+        }
+        assert!(text.contains("canonico"), "el JSON no pide la forma canónica");
+        assert!(text.contains("secuela"), "falta el límite de las secuelas");
+
+        // The same parser as the tags, with series names.
+        let raw = r#"{"grupos":[{"canonico":"Pokémon","variantes":["Pokemon","Pókemon"]}]}"#;
+        let groups = parse_merge_groups(raw, &series).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].canonico, "Pokémon");
+        assert_eq!(groups[0].variantes, vec!["Pokemon"]);
     }
 }

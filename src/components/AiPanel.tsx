@@ -6,10 +6,13 @@ import {
   aiRemoveKey,
   aiReorderKeys,
   aiStatus,
+  aiTagSuggestions,
   aiTestKey,
   aiUpdateKey,
+  mergeTags,
 } from "../lib/api";
 import { useI18n } from "../lib/i18n";
+import { MergeSuggestions } from "./MergeSuggestions";
 
 interface Props {
   open: boolean;
@@ -439,6 +442,9 @@ export function AiPanel({
               <span className="field-label">{t("ai.classifyTitle")}</span>
             </div>
             <span className="muted small">{t("ai.classifyNote")}</span>
+            <span className="muted small">
+              {t("ai.classifyModel", { model: status?.textModel ?? "openai/gpt-oss-20b" })}
+            </span>
             <button
               className="ghost-btn"
               onClick={() => void classify()}
@@ -452,6 +458,26 @@ export function AiPanel({
                   : t("ai.classify", { n: unclassified })}
             </button>
           </section>
+
+          <MergeSuggestions
+            disabled={locked}
+            scan={aiTagSuggestions}
+            apply={async (group) => {
+              const moved = await mergeTags(group.variantes, group.canonico);
+              await onUpdated();
+              return t("ai.tagsMerged", { n: moved, name: group.canonico });
+            }}
+            keys={{
+              title: "ai.tagsTitle",
+              note: "ai.tagsNote",
+              scan: "ai.tagsScan",
+              scanning: "ai.tagsScanning",
+              none: "ai.tagsNone",
+              apply: "ai.tagsApply",
+              applying: "ai.tagsApplying",
+              failed: "ai.tagsFailed",
+            }}
+          />
         </div>
 
         <section className="ai-run">

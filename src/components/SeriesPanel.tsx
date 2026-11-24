@@ -2,13 +2,15 @@ import { useEffect, useMemo, useState } from "react";
 import type { FacetCount } from "../types";
 import { useI18n } from "../lib/i18n";
 import { fold } from "../lib/search";
+import { aiSeriesSuggestions } from "../lib/api";
+import { MergeSuggestions } from "./MergeSuggestions";
 
 interface Props {
   series: FacetCount[];
   /** A merge is in flight: no closing and no second click. */
   busy: boolean;
   onClose: () => void;
-  onMerge: (from: string[], into: string) => void;
+  onMerge: (from: string[], into: string) => Promise<void> | void;
 }
 
 /**
@@ -110,6 +112,25 @@ export function SeriesPanel({ series, busy, onClose, onMerge }: Props) {
             ))}
           </div>
         )}
+
+        <MergeSuggestions
+          disabled={busy}
+          scan={aiSeriesSuggestions}
+          apply={async (group) => {
+            await onMerge(group.variantes, group.canonico);
+            return null;
+          }}
+          keys={{
+            title: "series.aiTitle",
+            note: "series.aiNote",
+            scan: "series.aiScan",
+            scanning: "series.aiScanning",
+            none: "series.aiNone",
+            apply: "series.aiApply",
+            applying: "series.aiApplying",
+            failed: "series.aiFailed",
+          }}
+        />
 
         <div className="series-merge">
           <label className="series-target">

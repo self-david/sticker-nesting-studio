@@ -35,6 +35,8 @@ pub struct Sticker {
     pub ai_at: i64,
     /// When the text classifier looked at this sticker (0 = never).
     pub classified_at: i64,
+    /// Words printed on the artwork, as the AI read them ("" = none).
+    pub texto: String,
 }
 
 /// What the AI needs to work on one sticker.
@@ -105,6 +107,8 @@ pub fn init(conn: &Connection) -> rusqlite::Result<()> {
         // Filled from now on: rows from older libraries keep an empty hash and
         // are matched by size and pixel dimensions instead.
         ("hash", "ALTER TABLE stickers ADD COLUMN hash TEXT NOT NULL DEFAULT '';"),
+        // The OCR of the artwork, filled by the vision model when it reads text.
+        ("texto", "ALTER TABLE stickers ADD COLUMN texto TEXT NOT NULL DEFAULT '';"),
     ] {
         if !columns.iter().any(|c| c == name) {
             conn.execute_batch(ddl)?;
@@ -459,24 +463,25 @@ pub fn list(
     sort: &str,
 ) -> Result<Vec<Sticker>, String> {
     let mut sql = String::from(
-        "SELECT id, name, file_name, ext, kind, width_px, height_px, width_mm, height_mm, dpi, has_alpha, size_bytes, created_at, ai_at, serie, tipo, classified_at FROM stickers",
+        "SELECT id, name, file_name, ext, kind, width_px, height_px, width_mm, height_mm, dpi, has_alpha, size_bytes, created_at, ai_at, serie, tipo, classified_at, texto FROM stickers",
     );
     let mut clauses: Vec<String> = Vec::new();
     let mut vals: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
     let q = query.trim().to_lowercase();
     if !q.is_empty() {
-        // The fields the search box promises: name, tag, series and type.
-        // Only lowercased here; folding accents and forgiving typos is the
-        // in-memory filter's job.
+        // The fields the search box promises: name, tag, series, type and the
+        // text printed on the sticker. Only lowercased here; folding accents
+        // and forgiving typos is the in-memory filter's job.
         clauses.push(
             "(lower(name) LIKE ? OR lower(coalesce(serie, '')) LIKE ? \
              OR lower(coalesce(tipo, '')) LIKE ? \
+             OR lower(coalesce(texto, '')) LIKE ? \
              OR id IN (SELECT sticker_id FROM sticker_tags WHERE lower(tag) LIKE ?))"
                 .into(),
         );
         let like = format!("%{}%", q);
-        for _ in 0..4 {
+        for _ in 0..5 {
             vals.push(Box::new(like.clone()));
         }
     }
@@ -521,6 +526,7 @@ pub fn list(
                 serie: r.get(14)?,
                 tipo: r.get(15)?,
                 classified_at: r.get(16)?,
+                texto: r.get(17)?,
                 file_path: String::new(),
                 thumb_path: String::new(),
                 tags: Vec::new(),
@@ -639,6 +645,7 @@ pub struct RestoredSticker {
     pub serie: String,
     pub tipo: String,
     pub classified_at: i64,
+    pub texto: String,
     pub tags: Vec<String>,
 }
 
@@ -647,8 +654,9 @@ pub fn insert_restored(conn: &mut Connection, s: &RestoredSticker) -> Result<(),
     let tx = conn.transaction().map_err(|e| e.to_string())?;
     tx.execute(
         "INSERT INTO stickers (id, name, file_name, ext, kind, width_px, height_px, width_mm, \
-         height_mm, dpi, has_alpha, size_bytes, created_at, ai_at, serie, tipo, classified_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+         height_mm, dpi, has_alpha, size_bytes, created_at, ai_at, serie, tipo, classified_at, \
+         texto) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
         params![
             s.id,
             s.name,
@@ -667,6 +675,7 @@ pub fn insert_restored(conn: &mut Connection, s: &RestoredSticker) -> Result<(),
             s.serie,
             s.tipo,
             s.classified_at,
+            s.texto,
         ],
     )
     .map_err(|e| e.to_string())?;
@@ -681,7 +690,7 @@ pub fn replace_restored(conn: &mut Connection, s: &RestoredSticker) -> Result<()
         "UPDATE stickers SET name = ?2, file_name = ?3, ext = ?4, kind = ?5, width_px = ?6, \
          height_px = ?7, width_mm = ?8, height_mm = ?9, dpi = ?10, has_alpha = ?11, \
          size_bytes = ?12, created_at = ?13, ai_at = ?14, serie = ?15, tipo = ?16, \
-         classified_at = ?17 WHERE id = ?1",
+         classified_at = ?17, texto = ?18 WHERE id = ?1",
         params![
             s.id,
             s.name,
@@ -700,6 +709,7 @@ pub fn replace_restored(conn: &mut Connection, s: &RestoredSticker) -> Result<()
             s.serie,
             s.tipo,
             s.classified_at,
+            s.texto,
         ],
     )
     .map_err(|e| e.to_string())?;
@@ -765,10 +775,12 @@ pub fn apply_ai(
     serie: &str,
     tipo: &str,
     tags: &[String],
+    texto: &str,
 ) -> Result<Vec<String>, String> {
     conn.execute(
-        "UPDATE stickers SET name = ?1, serie = ?2, tipo = ?3, ai_at = ?4 WHERE id = ?5",
-        params![name, serie, tipo, now_ms(), id],
+        "UPDATE stickers SET name = ?1, serie = ?2, tipo = ?3, ai_at = ?4, texto = ?6 \
+         WHERE id = ?5",
+        params![name, serie, tipo, now_ms(), id, texto],
     )
     .map_err(|e| e.to_string())?;
     set_tags(conn, id, tags)
@@ -903,6 +915,59 @@ pub fn merge_series(conn: &mut Connection, from: &[String], into: &str) -> Resul
                 .map_err(|e| e.to_string())?;
         }
     }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(changed)
+}
+
+/// Folds spellings of the same tag into one: every sticker tagged with any of
+/// `from` ends up with `into`, and a sticker that already carried it keeps one
+/// row instead of a duplicate the unique key would refuse. Returns how many
+/// stickers gained the canonical tag.
+pub fn merge_tags(conn: &mut Connection, from: &[String], into: &str) -> Result<usize, String> {
+    let into = normalize_tag(into).ok_or_else(|| "Escribe la etiqueta de destino".to_string())?;
+    let mut sources: Vec<String> = from
+        .iter()
+        .filter_map(|tag| normalize_tag(tag))
+        .filter(|tag| tag != &into)
+        .collect();
+    sources.sort();
+    sources.dedup();
+    if sources.is_empty() {
+        return Ok(0);
+    }
+
+    let holes = (1..=sources.len())
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let target = format!("?{}", sources.len() + 1);
+    let mut values: Vec<&str> = sources.iter().map(|tag| tag.as_str()).collect();
+    values.push(into.as_str());
+
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let changed = tx
+        .query_row(
+            &format!(
+                "SELECT COUNT(DISTINCT sticker_id) FROM sticker_tags WHERE tag IN ({holes}) \
+                 AND sticker_id NOT IN (SELECT sticker_id FROM sticker_tags WHERE tag = {target})"
+            ),
+            params_from_iter(values.iter().copied()),
+            |r| r.get::<_, i64>(0),
+        )
+        .map_err(|e| e.to_string())? as usize;
+    tx.execute(
+        &format!(
+            "DELETE FROM sticker_tags WHERE tag IN ({holes}) \
+             AND sticker_id IN (SELECT sticker_id FROM sticker_tags WHERE tag = {target})"
+        ),
+        params_from_iter(values.iter().copied()),
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        &format!("UPDATE OR IGNORE sticker_tags SET tag = {target} WHERE tag IN ({holes})"),
+        params_from_iter(values.iter().copied()),
+    )
+    .map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())?;
     Ok(changed)
 }
@@ -1124,7 +1189,7 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
-        for name in ["serie", "tipo", "classified_at"] {
+        for name in ["serie", "tipo", "classified_at", "texto"] {
             assert!(cols.iter().any(|c| c == name), "falta la columna {name}");
         }
     }
@@ -1167,6 +1232,27 @@ mod tests {
         assert!(search("goku").is_empty());
         // Nothing typed yet is not a filter.
         assert_eq!(search("  ").len(), 1);
+    }
+
+    #[test]
+    fn the_ai_printed_text_is_saved_and_searchable() {
+        let conn = library();
+        apply_ai(
+            &conn,
+            "a",
+            "Tarta",
+            "Repostería",
+            "cotidiano",
+            &["postre".into()],
+            "feliz cumpleaños",
+        )
+        .unwrap();
+
+        let list = list(&conn, Path::new("C:/lib"), "cumpleaños", &[], "name").unwrap();
+        assert_eq!(list.len(), 1, "el texto impreso no llega a la búsqueda");
+        assert_eq!(list[0].texto, "feliz cumpleaños");
+        // A sticker without printed text keeps an empty column, never NULL.
+        assert_eq!(list[0].name, "Tarta");
     }
 
     fn second(conn: &Connection, id: &str, name: &str) {
@@ -1238,6 +1324,35 @@ mod tests {
         );
         assert!(merge_series(&mut conn, &[], "X").is_err());
         assert!(merge_series(&mut conn, &["Pokémon".to_string()], "  ").is_err());
+    }
+
+    #[test]
+    fn merging_tags_leaves_one_row_per_sticker() {
+        let mut conn = library();
+        second(&conn, "b", "Mandala");
+        // «a» already carries both spellings; «b» only the variant.
+        set_tags(
+            &conn,
+            "a",
+            &["perro".into(), "perritos".into(), "amarillo".into()],
+        )
+        .unwrap();
+        set_tags(&conn, "b", &["Perritos".into(), "amarillo".into()]).unwrap();
+
+        let moved = merge_tags(&mut conn, &["perritos".to_string()], " perro ").unwrap();
+        assert_eq!(moved, 1, "solo «b» gana la etiqueta");
+
+        let counts = all_tags(&conn).unwrap();
+        let perro = counts.iter().find(|t| t.tag == "perro").unwrap();
+        assert_eq!(perro.count, 2);
+        assert!(counts.iter().all(|t| t.tag != "perritos"), "queda la variante");
+
+        // Merging a tag into itself moves nothing; an empty target is an error.
+        assert_eq!(
+            merge_tags(&mut conn, &["perro".to_string()], "perro").unwrap(),
+            0
+        );
+        assert!(merge_tags(&mut conn, &["perro".to_string()], "   ").is_err());
     }
 
     #[test]

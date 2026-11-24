@@ -571,7 +571,7 @@ fn ai_reorder_keys(
 /// the ids, so the same command serves both the bulk run and one sticker.
 #[tauri::command]
 async fn ai_describe(state: State<'_, AppState>, ids: Vec<String>) -> Result<ai::Report, String> {
-    let Some((keys, model)) = ai::load(&state.root) else {
+    let Some((keys, model, _)) = ai::load(&state.root) else {
         return Err("Añade al menos una clave de Groq en «Renombrar con IA».".to_string());
     };
 
@@ -631,6 +631,7 @@ async fn ai_describe(state: State<'_, AppState>, ids: Vec<String>) -> Result<ai:
                         &answer.serie,
                         &answer.tipo,
                         &answer.tags,
+                        &answer.texto,
                     )
                 };
                 match saved {
@@ -656,7 +657,7 @@ async fn ai_describe(state: State<'_, AppState>, ids: Vec<String>) -> Result<ai:
 /// neither the name nor the tags are written.
 #[tauri::command]
 async fn ai_classify(state: State<'_, AppState>) -> Result<ai::Report, String> {
-    let Some((keys, model)) = ai::load(&state.root) else {
+    let Some((keys, _, text_model)) = ai::load(&state.root) else {
         return Err("Añade al menos una clave de Groq en «Renombrar con IA».".to_string());
     };
 
@@ -682,7 +683,7 @@ async fn ai_classify(state: State<'_, AppState>) -> Result<ai::Report, String> {
             .collect();
         let wanted: Vec<String> = inputs.iter().map(|item| item.id.clone()).collect();
         let chat = ai::Chat {
-            model: &model,
+            model: &text_model,
             system: ai::CLASSIFY_SYSTEM,
             content: ai::classify_content(&series, &inputs),
             max_tokens: ai::CLASSIFY_MAX_TOKENS,
@@ -737,6 +738,63 @@ async fn ai_classify(state: State<'_, AppState>) -> Result<ai::Report, String> {
     }
 
     Ok(ai::Report { updated, failures })
+}
+
+/// One text-only request with the saved text model: no image, no artwork.
+async fn ask_text(
+    state: &State<'_, AppState>,
+    system: &str,
+    content: serde_json::Value,
+) -> Result<String, String> {
+    let Some((keys, _, text_model)) = ai::load(&state.root) else {
+        return Err("Añade al menos una clave de Groq en «Renombrar con IA».".to_string());
+    };
+    let client = ai::client()?;
+    let chat = ai::Chat {
+        model: &text_model,
+        system,
+        content,
+        max_tokens: ai::SUGGEST_MAX_TOKENS,
+    };
+    ask_with_keys(state, &client, &keys, &chat).await
+}
+
+/// Reads the tag vocabulary and asks the text model which spellings are the same
+/// word. Writes nothing: the panel shows the groups and the user applies them.
+#[tauri::command]
+async fn ai_normalize_tags(state: State<'_, AppState>) -> Result<Vec<ai::MergeGroup>, String> {
+    let tags = {
+        let conn = state.conn.lock().map_err(|e| e.to_string())?;
+        db::all_tags(&conn)?
+    };
+    let names: Vec<String> = tags.into_iter().map(|tag| tag.tag).collect();
+    if names.len() < 2 {
+        return Ok(Vec::new());
+    }
+    let raw = ask_text(&state, ai::TAGS_SYSTEM, ai::tags_content(&names)).await?;
+    ai::parse_merge_groups(&raw, &names)
+}
+
+/// Same for the series in use. Writes nothing: `merge_series` moves the stickers.
+#[tauri::command]
+async fn ai_series_suggestions(state: State<'_, AppState>) -> Result<Vec<ai::MergeGroup>, String> {
+    let series = {
+        let conn = state.conn.lock().map_err(|e| e.to_string())?;
+        db::known_series(&conn)?
+    };
+    if series.len() < 2 {
+        return Ok(Vec::new());
+    }
+    let raw = ask_text(&state, ai::SERIES_SYSTEM, ai::series_content(&series)).await?;
+    ai::parse_merge_groups(&raw, &series)
+}
+
+/// Folds several spellings of the same tag into one, keeping each sticker's
+/// tags unique.
+#[tauri::command]
+fn merge_tags(state: State<'_, AppState>, from: Vec<String>, into: String) -> Result<usize, String> {
+    let mut conn = state.conn.lock().map_err(|e| e.to_string())?;
+    db::merge_tags(&mut conn, &from, &into)
 }
 
 /// One request per key, starting where the previous sticker left off, and
@@ -850,7 +908,7 @@ fn clear_cooldown(state: &State<'_, AppState>, id: &str) {
 /// whether it answers, is throttled or is rejected.
 #[tauri::command]
 async fn ai_test_key(state: State<'_, AppState>, id: String) -> Result<ai::KeyCheck, String> {
-    let Some((keys, model)) = ai::load(&state.root) else {
+    let Some((keys, model, _)) = ai::load(&state.root) else {
         return Err("Añade al menos una clave de Groq.".into());
     };
     let key = keys
@@ -1208,6 +1266,7 @@ pub fn run() {
             set_sticker_classification,
             set_stickers_classification,
             merge_series,
+            merge_tags,
             export_library,
             inspect_library_archive,
             import_library_archive,
@@ -1218,6 +1277,8 @@ pub fn run() {
             ai_reorder_keys,
             ai_describe,
             ai_classify,
+            ai_normalize_tags,
+            ai_series_suggestions,
             ai_test_key,
             update_sticker,
             set_sticker_tags,

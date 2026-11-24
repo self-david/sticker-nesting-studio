@@ -84,6 +84,8 @@ interface Folded {
   tags: string[];
   serie: string;
   tipo: string;
+  /** The words printed on the sticker, read by the AI. */
+  texto: string;
 }
 
 /** Folding is done once per sticker, not once per term. */
@@ -93,6 +95,7 @@ function foldSticker(sticker: Sticker): Folded {
     tags: sticker.tags.map(fold),
     serie: fold(sticker.serie ?? ""),
     tipo: fold(sticker.tipo ?? ""),
+    texto: fold(sticker.texto ?? ""),
   };
 }
 
@@ -102,11 +105,12 @@ function startsAll(value: string, wanted: string[]): boolean {
 }
 
 /** Free words look everywhere the sticker names itself, columns included. */
-function hit({ name, tags, serie, tipo }: Folded, needle: string): boolean {
+function hit({ name, tags, serie, tipo, texto }: Folded, needle: string): boolean {
   return (
     name.includes(needle) ||
     serie.includes(needle) ||
     tipo.includes(needle) ||
+    texto.includes(needle) ||
     tags.some((tag) => tag.includes(needle))
   );
 }
@@ -165,7 +169,7 @@ function nearWord(word: string, term: string, max: number): boolean {
 function nearAnyWord(folded: Folded, term: string): boolean {
   const max = editsAllowed(term);
   if (max === 0) return false;
-  const words = `${folded.name} ${folded.serie} ${folded.tipo} ${folded.tags.join(" ")}`;
+  const words = `${folded.name} ${folded.serie} ${folded.tipo} ${folded.texto} ${folded.tags.join(" ")}`;
   return words.split(/[^\p{L}\p{N}]+/u).some((word) => word.length > 0 && nearWord(word, term, max));
 }
 
