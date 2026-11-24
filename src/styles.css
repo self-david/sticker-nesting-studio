@@ -1866,6 +1866,14 @@ button {
   color: #d6c8ff;
 }
 
+.import-progress {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
 .toast {
   position: fixed;
   bottom: 20px;

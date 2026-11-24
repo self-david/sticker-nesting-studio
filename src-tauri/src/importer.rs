@@ -1,11 +1,16 @@
 use image::GenericImageView;
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 pub const THUMB_MAX: u32 = 420;
+/// Pixels at least this opaque count as content when trimming the margins.
+pub const TRIM_ALPHA: u8 = 8;
 
 pub struct Probe {
     pub kind: &'static str,
+    /// The stored file lost empty margins on the way in.
+    pub trimmed: bool,
     pub width_px: f64,
     pub height_px: f64,
     pub width_mm: f64,
@@ -283,6 +288,7 @@ pub fn probe(src: &Path, ext: &str, thumbs: &Path, id: &str) -> Result<Probe, St
         })?;
         return Ok(Probe {
             kind: "vector",
+            trimmed: false,
             width_px: 0.0,
             height_px: 0.0,
             width_mm: round2(w),
@@ -294,13 +300,22 @@ pub fn probe(src: &Path, ext: &str, thumbs: &Path, id: &str) -> Result<Probe, St
 
     // Read once: the density lives in the container, not in the pixels.
     let bytes = fs::read(src).map_err(|e| format!("No se pudo leer la imagen: {e}"))?;
-    let img = image::load_from_memory(&bytes)
+    let loaded = image::load_from_memory(&bytes)
         .map_err(|e| format!("No se pudo decodificar la imagen: {e}"))?;
+    let has_alpha = loaded.color().has_alpha();
+    // Transparent margins are not part of the sticker: cropping them here
+    // makes every sheet denser without touching the nester.
+    let trimmed_img = if ext == "png" && has_alpha {
+        trim_margins(&loaded, src)
+    } else {
+        None
+    };
+    let trimmed = trimmed_img.is_some();
+    let img = trimmed_img.unwrap_or(loaded);
     let (w, h) = img.dimensions();
     if w == 0 || h == 0 {
         return Err("La imagen está vacía".into());
     }
-    let has_alpha = img.color().has_alpha();
     // The file's own density when it declares a sane one; 300 dpi is only the
     // fallback for artwork that carries no physical size at all.
     let dpi = declared_dpi(&bytes, ext).map(sane_dpi).unwrap_or(300.0);
@@ -317,6 +332,7 @@ pub fn probe(src: &Path, ext: &str, thumbs: &Path, id: &str) -> Result<Probe, St
 
     Ok(Probe {
         kind: "raster",
+        trimmed,
         width_px: w as f64,
         height_px: h as f64,
         width_mm: round2(w as f64 * 25.4 / dpi),
@@ -346,6 +362,56 @@ pub fn sanitize_name(raw: &str) -> String {
 
 pub fn target_file(files: &Path, id: &str, ext: &str) -> PathBuf {
     files.join(format!("{id}.{ext}"))
+}
+
+/// SHA-256 of a file's bytes: the same artwork imported twice gives the same
+/// value, so the library does not collect copies of what it already has.
+pub fn hash_bytes(bytes: &[u8]) -> String {
+    hex(&Sha256::digest(bytes))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+/// Box around the pixels that carry ink, or `None` when the whole image is
+/// empty. Empty canvas is common in exported artwork and costs nesting room.
+fn content_box(img: &image::DynamicImage) -> Option<(u32, u32, u32, u32)> {
+    let rgba = img.to_rgba8();
+    let (w, h) = (rgba.width(), rgba.height());
+    let (mut left, mut top, mut right, mut bottom) = (w, h, 0u32, 0u32);
+    for y in 0..h {
+        for x in 0..w {
+            if rgba.get_pixel(x, y)[3] > TRIM_ALPHA {
+                left = left.min(x);
+                top = top.min(y);
+                right = right.max(x + 1);
+                bottom = bottom.max(y + 1);
+            }
+        }
+    }
+    (right > left && bottom > top).then_some((left, top, right - left, bottom - top))
+}
+
+/// Drops the transparent border of a PNG and writes the result back over the
+/// stored copy. Other formats are left alone: only PNG is both lossless and
+/// written by this crate.
+fn trim_margins(img: &image::DynamicImage, path: &Path) -> Option<image::DynamicImage> {
+    let (x, y, w, h) = content_box(&img)?;
+    if x == 0 && y == 0 && w == img.width() && h == img.height() {
+        return None;
+    }
+    let cropped = image::DynamicImage::ImageRgba8(
+        image::imageops::crop_imm(img, x, y, w, h).to_image(),
+    );
+    cropped
+        .save_with_format(path, image::ImageFormat::Png)
+        .ok()?;
+    Some(cropped)
 }
 
 #[cfg(test)]
@@ -449,6 +515,39 @@ mod tests {
         assert!((probe.width_mm - 8.0 * 25.4 / 300.0).abs() < 0.01);
         assert!(probe.has_alpha);
         assert!(dir.join("prueba.png").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn trims_the_transparent_margins_of_a_png() {
+        let dir = std::env::temp_dir().join(format!("sns-trim-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("margen.png");
+        let mut img = image::RgbaImage::from_pixel(20, 20, image::Rgba([0, 0, 0, 0]));
+        for y in 5..15 {
+            for x in 5..15 {
+                img.put_pixel(x, y, image::Rgba([255, 0, 0, 255]));
+            }
+        }
+        img.save(&path).unwrap();
+
+        let trimmed_probe = probe(&path, "png", &dir, "recorte").unwrap();
+        assert!(trimmed_probe.trimmed);
+        assert!((trimmed_probe.width_px - 10.0).abs() < 1e-6);
+        assert!((trimmed_probe.height_px - 10.0).abs() < 1e-6);
+        // The stored copy lost the border too, so the PDF sees the same artwork.
+        let stored = image::open(&path).unwrap();
+        assert_eq!((stored.width(), stored.height()), (10, 10));
+
+        // Artwork that fills its canvas is left exactly as it came.
+        let full = dir.join("lleno.png");
+        image::RgbaImage::from_pixel(12, 12, image::Rgba([0, 0, 255, 255]))
+            .save(&full)
+            .unwrap();
+        let untouched = probe(&full, "png", &dir, "lleno").unwrap();
+        assert!(!untouched.trimmed);
+        assert!((untouched.width_px - 12.0).abs() < 1e-6);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

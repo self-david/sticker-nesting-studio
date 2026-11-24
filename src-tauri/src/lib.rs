@@ -11,14 +11,18 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
 
 pub struct AppState {
-    pub conn: Mutex<Connection>,
+    /// Shared so the heavy import can read and write rows from its own thread.
+    pub conn: Arc<Mutex<Connection>>,
     pub root: PathBuf,
+    /// Set while an import runs: the loop stops after the file in hand.
+    pub cancel_import: Arc<AtomicBool>,
     /// Which saved key the next AI request starts from.
     pub ai_cursor: Mutex<usize>,
     /// Keys Groq has throttled, with the moment they can be used again.
@@ -32,11 +36,22 @@ struct ImportFailure {
     message: String,
 }
 
+/// A file the library already holds, reported instead of copied twice.
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImportDuplicate {
+    path: String,
+    name: String,
+    existing_id: String,
+}
+
+#[derive(Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct ImportReport {
     imported_ids: Vec<String>,
     errors: Vec<ImportFailure>,
+    duplicates: Vec<ImportDuplicate>,
+    cancelled: bool,
 }
 
 #[derive(Serialize)]
@@ -47,89 +62,303 @@ struct LibraryInfo {
     bytes: i64,
 }
 
-#[tauri::command]
-fn import_paths(state: State<'_, AppState>, paths: Vec<String>) -> Result<ImportReport, String> {
-    let files = state.root.join("files");
-    let thumbs = state.root.join("thumbs");
-    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImportProgress {
+    done: usize,
+    total: usize,
+    name: String,
+}
 
-    let mut imported_ids = Vec::new();
-    let mut errors = Vec::new();
+/// What the library already has, so a repeat costs no copy and no row.
+/// Rows imported before the hash column existed fall back to extension plus
+/// byte size, which is only ever a question to the user, never a silent skip.
+struct KnownIndex {
+    by_hash: HashMap<String, (String, String)>,
+    by_size: HashMap<String, (String, String)>,
+}
 
-    for raw in paths {
+impl KnownIndex {
+    fn build(files: Vec<db::KnownFile>) -> Self {
+        let mut by_hash = HashMap::new();
+        let mut by_size = HashMap::new();
+        for file in files {
+            if file.hash.is_empty() {
+                by_size.insert(legacy_key(&file.ext, file.size_bytes), (file.id, file.name));
+            } else {
+                by_hash.insert(file.hash, (file.id, file.name));
+            }
+        }
+        KnownIndex { by_hash, by_size }
+    }
+
+    fn find(&self, hash: &str, size: &str) -> Option<&(String, String)> {
+        self.by_hash.get(hash).or_else(|| self.by_size.get(size))
+    }
+
+    fn remember(&mut self, hash: &str, id: &str, name: &str) {
+        self.by_hash
+            .insert(hash.to_string(), (id.to_string(), name.to_string()));
+    }
+}
+
+/// Fingerprint of a row that carries no hash yet.
+fn legacy_key(ext: &str, bytes: i64) -> String {
+    format!("{}|{}", ext.to_ascii_lowercase(), bytes)
+}
+
+/// A file copied, measured and thumbnailed, waiting only for its row.
+struct Prepared {
+    id: String,
+    source: String,
+    name: String,
+    file_name: String,
+    ext: String,
+    hash: String,
+    probe: importer::Probe,
+    size_bytes: i64,
+}
+
+struct Batch {
+    prepared: Vec<Prepared>,
+    duplicates: Vec<ImportDuplicate>,
+    errors: Vec<ImportFailure>,
+    cancelled: bool,
+}
+
+/// Everything expensive about an import happens here, off the UI thread: the
+/// hash, the copy, the density read, the margin trim and the thumbnail. The
+/// rows are written by the caller, which owns the connection.
+fn prepare_batch(
+    app: tauri::AppHandle,
+    root: PathBuf,
+    paths: Vec<String>,
+    mut known: KnownIndex,
+    allow_duplicates: bool,
+    cancel: Arc<AtomicBool>,
+) -> Batch {
+    let files = root.join("files");
+    let thumbs = root.join("thumbs");
+    let total = paths.len();
+    let mut batch = Batch {
+        prepared: Vec::new(),
+        duplicates: Vec::new(),
+        errors: Vec::new(),
+        cancelled: false,
+    };
+
+    for (index, raw) in paths.into_iter().enumerate() {
+        if cancel.load(Ordering::SeqCst) {
+            batch.cancelled = true;
+            break;
+        }
         let src = PathBuf::from(&raw);
+        let name = src
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| raw.clone());
+        let _ = app.emit(
+            "import:progress",
+            ImportProgress {
+                done: index,
+                total,
+                name: name.clone(),
+            },
+        );
+
         let ext = src
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_ascii_lowercase();
         if !importer::allowed_ext(&ext) {
-            errors.push(ImportFailure {
-                path: raw.clone(),
+            batch.errors.push(ImportFailure {
+                path: raw,
                 message: "Formato no compatible (PNG, SVG, JPG o WebP)".into(),
             });
             continue;
         }
         if !src.is_file() {
-            errors.push(ImportFailure {
-                path: raw.clone(),
+            batch.errors.push(ImportFailure {
+                path: raw,
                 message: "El archivo no existe".into(),
             });
             continue;
         }
 
+        let bytes = match fs::read(&src) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                batch.errors.push(ImportFailure {
+                    path: raw,
+                    message: format!("No se pudo leer: {e}"),
+                });
+                continue;
+            }
+        };
+        let hash = importer::hash_bytes(&bytes);
+        // The size read here is the source file's, which is what a row from
+        // before the hash column recorded.
+        let size = legacy_key(&ext, bytes.len() as i64);
+        if !allow_duplicates {
+            if let Some((existing_id, stored_name)) = known.find(&hash, &size) {
+                batch.duplicates.push(ImportDuplicate {
+                    path: raw,
+                    name: stored_name.clone(),
+                    existing_id: existing_id.clone(),
+                });
+                continue;
+            }
+        }
+
         let id = uuid::Uuid::new_v4().to_string();
         let dest = importer::target_file(&files, &id, &ext);
+        if let Err(e) = fs::write(&dest, &bytes) {
+            batch.errors.push(ImportFailure {
+                path: raw,
+                message: format!("No se pudo copiar: {e}"),
+            });
+            continue;
+        }
 
-        let result = (|| -> Result<(), String> {
-            fs::copy(&src, &dest).map_err(|e| format!("No se pudo copiar: {e}"))?;
-            let probe = importer::probe(&dest, &ext, &thumbs, &id)?;
-            let stem = src
-                .file_stem()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let size_bytes = fs::metadata(&dest).map(|m| m.len() as i64).unwrap_or(0);
-            let file_name = dest
-                .file_name()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_default();
-
-            db::insert(
-                &conn,
-                &db::NewSticker {
-                    id: &id,
-                    name: &importer::sanitize_name(&stem),
-                    file_name: &file_name,
-                    ext: &ext,
-                    kind: probe.kind,
-                    width_px: probe.width_px,
-                    height_px: probe.height_px,
-                    width_mm: probe.width_mm,
-                    height_mm: probe.height_mm,
-                    dpi: probe.dpi,
-                    has_alpha: probe.has_alpha,
+        match importer::probe(&dest, &ext, &thumbs, &id) {
+            Ok(probe) => {
+                let stem = src
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let clean = importer::sanitize_name(&stem);
+                let size_bytes = fs::metadata(&dest).map(|m| m.len() as i64).unwrap_or(0);
+                let file_name = dest
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                known.remember(&hash, &id, &clean);
+                batch.prepared.push(Prepared {
+                    id,
+                    source: raw,
+                    name: clean,
+                    file_name,
+                    ext: ext.clone(),
+                    hash,
+                    probe,
                     size_bytes,
-                },
-            )
-            .map_err(|e| format!("No se pudo guardar en la biblioteca: {e}"))?;
-            Ok(())
-        })();
-
-        match result {
-            Ok(()) => imported_ids.push(id),
+                });
+            }
             Err(message) => {
-                let _ = fs::remove_file(&dest);
-                let _ = fs::remove_file(thumbs.join(format!("{id}.png")));
-                let _ = fs::remove_file(thumbs.join(format!("{id}.jpg")));
-                errors.push(ImportFailure { path: raw, message });
+                remove_artwork(&root, &id, &dest);
+                batch.errors.push(ImportFailure {
+                    path: raw,
+                    message,
+                });
             }
         }
     }
 
-    Ok(ImportReport {
-        imported_ids,
-        errors,
+    let _ = app.emit(
+        "import:progress",
+        ImportProgress {
+            done: if batch.cancelled {
+                batch.prepared.len() + batch.duplicates.len() + batch.errors.len()
+            } else {
+                total
+            },
+            total,
+            name: String::new(),
+        },
+    );
+    batch
+}
+
+fn remove_artwork(root: &Path, id: &str, dest: &Path) {
+    let _ = fs::remove_file(dest);
+    let _ = fs::remove_file(root.join("thumbs").join(format!("{id}.png")));
+    let _ = fs::remove_file(root.join("thumbs").join(format!("{id}.jpg")));
+}
+
+/// Copies the chosen files into the library. The hashing, decoding and
+/// thumbnailing run off the UI thread and report their progress, and a cancel
+/// stops the batch between files; only the rows are written here.
+#[tauri::command]
+async fn import_paths(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    paths: Vec<String>,
+    allow_duplicates: Option<bool>,
+) -> Result<ImportReport, String> {
+    if paths.is_empty() {
+        return Ok(ImportReport::default());
+    }
+    let known = {
+        let conn = state.conn.lock().map_err(|e| e.to_string())?;
+        KnownIndex::build(db::known_files(&conn)?)
+    };
+    let root = state.root.clone();
+    let cancel = state.cancel_import.clone();
+    cancel.store(false, Ordering::SeqCst);
+
+    let batch = tauri::async_runtime::spawn_blocking(move || {
+        prepare_batch(
+            app,
+            root,
+            paths,
+            known,
+            allow_duplicates.unwrap_or(false),
+            cancel,
+        )
     })
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let mut report = ImportReport {
+        duplicates: batch.duplicates,
+        cancelled: batch.cancelled,
+        ..ImportReport::default()
+    };
+    report.errors.extend(batch.errors);
+    if batch.prepared.is_empty() {
+        return Ok(report);
+    }
+
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    for item in batch.prepared {
+        let result = db::insert(
+            &conn,
+            &db::NewSticker {
+                id: &item.id,
+                name: &item.name,
+                file_name: &item.file_name,
+                ext: &item.ext,
+                kind: item.probe.kind,
+                width_px: item.probe.width_px,
+                height_px: item.probe.height_px,
+                width_mm: item.probe.width_mm,
+                height_mm: item.probe.height_mm,
+                dpi: item.probe.dpi,
+                has_alpha: item.probe.has_alpha,
+                size_bytes: item.size_bytes,
+                hash: &item.hash,
+            },
+        );
+        match result {
+            Ok(()) => report.imported_ids.push(item.id),
+            Err(e) => {
+                let dest = state.root.join("files").join(&item.file_name);
+                remove_artwork(&state.root, &item.id, &dest);
+                report.errors.push(ImportFailure {
+                    path: item.source,
+                    message: format!("No se pudo guardar en la biblioteca: {e}"),
+                });
+            }
+        }
+    }
+    Ok(report)
+}
+
+/// Asks the running import to stop after the file it is working on.
+#[tauri::command]
+fn cancel_import(state: State<'_, AppState>) {
+    state.cancel_import.store(true, Ordering::SeqCst);
 }
 
 #[tauri::command]
@@ -764,7 +993,7 @@ struct PdfExportPage {
 }
 
 #[tauri::command]
-fn export_sheet_pdf(
+async fn export_sheet_pdf(
     path: String,
     pages: Vec<PdfExportPage>,
     cut_lines: bool,
@@ -804,9 +1033,15 @@ fn export_sheet_pdf(
         width_mm: outline_width_mm.clamp(0.05, 5.0),
         padding_mm: outline_padding_mm.clamp(0.0, 30.0),
     });
+    // Encoding pages at 300 dpi takes seconds on a full sheet: keep it off the
+    // UI thread, as the import and the nesting already do.
     let dest = PathBuf::from(&path);
-    pdf::export(&dest, &specs, outline.as_ref())?;
-    Ok(dest.to_string_lossy().to_string())
+    tauri::async_runtime::spawn_blocking(move || {
+        pdf::export(&dest, &specs, outline.as_ref())?;
+        Ok(dest.to_string_lossy().to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Writes the sheet as one `.sns` file (a ZIP holding the artwork and
@@ -903,6 +1138,46 @@ fn reveal_library(state: State<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn known(hash: &str, id: &str, ext: &str, bytes: i64) -> db::KnownFile {
+        db::KnownFile {
+            id: id.to_string(),
+            name: format!("nombre-{id}"),
+            hash: hash.to_string(),
+            ext: ext.to_string(),
+            size_bytes: bytes,
+        }
+    }
+
+    #[test]
+    fn a_repeat_is_found_by_hash_and_old_rows_by_size() {
+        let index = KnownIndex::build(vec![
+            known("abc", "nuevo", "png", 10),
+            known("", "viejo", "JPG", 20),
+        ]);
+
+        let by_hash = index.find("abc", "png|999").expect("same bytes");
+        assert_eq!(by_hash.0, "nuevo");
+        assert_eq!(by_hash.1, "nombre-nuevo");
+
+        // A row from before the hash existed: extension and byte size match.
+        let by_size = index.find("otro", &legacy_key("jpg", 20)).expect("old row");
+        assert_eq!(by_size.0, "viejo");
+
+        assert!(index.find("desconocido", &legacy_key("png", 1)).is_none());
+    }
+
+    #[test]
+    fn the_hash_tells_the_same_artwork_from_an_edit() {
+        assert_eq!(importer::hash_bytes(b"uno"), importer::hash_bytes(b"uno"));
+        assert_ne!(importer::hash_bytes(b"uno"), importer::hash_bytes(b"dos"));
+        assert_eq!(importer::hash_bytes(b"uno").len(), 64);
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -930,6 +1205,8 @@ pub fn run() {
                 .build(),
         )
         .plugin(tauri_plugin_dialog::init())
+        // Remembers the window's size and place between launches.
+        .plugin(tauri_plugin_window_state::Builder::default().build())
         .setup(|app| {
             let root = app.path().app_data_dir()?;
             fs::create_dir_all(root.join("files"))?;
@@ -950,8 +1227,9 @@ pub fn run() {
                 Err(message) => log::warn!("no se pudo crear la copia de seguridad: {message}"),
             }
             app.manage(AppState {
-                conn: Mutex::new(conn),
+                conn: Arc::new(Mutex::new(conn)),
                 root,
+                cancel_import: Arc::new(AtomicBool::new(false)),
                 ai_cursor: Mutex::new(0),
                 ai_cooldowns: Mutex::new(HashMap::new()),
             });
@@ -959,6 +1237,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             import_paths,
+            cancel_import,
             list_stickers,
             list_tags,
             list_series,

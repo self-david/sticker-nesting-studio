@@ -68,7 +68,8 @@ pub fn init(conn: &Connection) -> rusqlite::Result<()> {
             dpi         REAL NOT NULL,
             has_alpha   INTEGER NOT NULL DEFAULT 0,
             size_bytes  INTEGER NOT NULL DEFAULT 0,
-            created_at  INTEGER NOT NULL
+            created_at  INTEGER NOT NULL,
+            hash        TEXT NOT NULL DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS sticker_tags (
             sticker_id TEXT NOT NULL,
@@ -101,6 +102,9 @@ pub fn init(conn: &Connection) -> rusqlite::Result<()> {
             "classified_at",
             "ALTER TABLE stickers ADD COLUMN classified_at INTEGER NOT NULL DEFAULT 0;",
         ),
+        // Filled from now on: rows from older libraries keep an empty hash and
+        // are matched by size and pixel dimensions instead.
+        ("hash", "ALTER TABLE stickers ADD COLUMN hash TEXT NOT NULL DEFAULT '';"),
     ] {
         if !columns.iter().any(|c| c == name) {
             conn.execute_batch(ddl)?;
@@ -379,12 +383,14 @@ pub struct NewSticker<'a> {
     pub dpi: f64,
     pub has_alpha: bool,
     pub size_bytes: i64,
+    /// SHA-256 of the source file, so a re-import can be spotted.
+    pub hash: &'a str,
 }
 
 pub fn insert(conn: &Connection, s: &NewSticker<'_>) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO stickers (id, name, file_name, ext, kind, width_px, height_px, width_mm, height_mm, dpi, has_alpha, size_bytes, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        "INSERT INTO stickers (id, name, file_name, ext, kind, width_px, height_px, width_mm, height_mm, dpi, has_alpha, size_bytes, created_at, hash)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             s.id,
             s.name,
@@ -399,9 +405,38 @@ pub fn insert(conn: &Connection, s: &NewSticker<'_>) -> rusqlite::Result<()> {
             if s.has_alpha { 1 } else { 0 },
             s.size_bytes,
             now_ms(),
+            s.hash,
         ],
     )?;
     Ok(())
+}
+
+/// What an import needs to know about the library to spot a repeat.
+pub struct KnownFile {
+    pub id: String,
+    pub name: String,
+    pub hash: String,
+    pub ext: String,
+    pub size_bytes: i64,
+}
+
+pub fn known_files(conn: &Connection) -> Result<Vec<KnownFile>, String> {
+    let mut stmt = conn
+        .prepare("SELECT id, name, hash, ext, size_bytes FROM stickers")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(KnownFile {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                hash: r.get(2)?,
+                ext: r.get(3)?,
+                size_bytes: r.get(4)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| e.to_string())
 }
 
 fn tags_map(conn: &Connection) -> HashMap<String, Vec<String>> {
@@ -1063,6 +1098,7 @@ mod tests {
                 dpi: 300.0,
                 has_alpha: true,
                 size_bytes: 10,
+                hash: "",
             },
         )
         .unwrap();
@@ -1121,6 +1157,7 @@ mod tests {
                 dpi: 300.0,
                 has_alpha: true,
                 size_bytes: 1,
+                hash: "",
             },
         )
         .unwrap();
@@ -1194,6 +1231,7 @@ mod tests {
                 dpi: 300.0,
                 has_alpha: true,
                 size_bytes: 1,
+                hash: "",
             },
         )
         .unwrap();

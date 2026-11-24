@@ -890,6 +890,7 @@ mod tests {
                 dpi: 300.0,
                 has_alpha: true,
                 size_bytes: 10,
+                hash: "",
             },
         )
         .unwrap();

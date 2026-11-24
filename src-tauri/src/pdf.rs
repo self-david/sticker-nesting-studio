@@ -44,11 +44,24 @@ pub struct Outline {
     pub padding_mm: f64,
 }
 
+/// How the pixels travel into the PDF. Flate is lossless and right for flat
+/// artwork; photos are stored as JPEG, which is several times smaller for the
+/// same visible result at sticker size.
+#[derive(Clone, Copy)]
+enum Codec {
+    Flate,
+    Jpeg,
+}
+
 struct Raster {
     width: u32,
     height: u32,
     stream: Vec<u8>,
+    compression: Codec,
 }
+
+/// Quality of the JPEG written for photo sources.
+const JPEG_QUALITY: u8 = 92;
 
 /// A unique source file: its real aspect ratio, the largest size it is printed
 /// at, and its XObject index once loaded.
@@ -198,6 +211,7 @@ fn load_raster(path: &Path, width_mm: f64, height_mm: f64) -> Result<Raster, Str
             width,
             height,
             stream: deflate(&rgb)?,
+            compression: Codec::Flate,
         });
     }
 
@@ -220,11 +234,32 @@ fn load_raster(path: &Path, width_mm: f64, height_mm: f64) -> Result<Raster, Str
     };
 
     let (width, height) = (img.width(), img.height());
+    // A JPEG source goes back out as JPEG: re-deflating it as raw RGB would
+    // multiply the PDF size for no gain in quality.
+    if ext == "jpg" || ext == "jpeg" {
+        let rgb = image::DynamicImage::ImageRgb8(img.to_rgb8());
+        let mut stream = Vec::new();
+        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(
+            &mut stream,
+            JPEG_QUALITY,
+        );
+        encoder
+            .encode_image(&rgb)
+            .map_err(|e| format!("No se pudo comprimir la foto: {e}"))?;
+        return Ok(Raster {
+            width,
+            height,
+            stream,
+            compression: Codec::Jpeg,
+        });
+    }
+
     let rgb = flatten(&img);
     Ok(Raster {
         width,
         height,
         stream: deflate(&rgb)?,
+        compression: Codec::Flate,
     })
 }
 
@@ -417,10 +452,15 @@ pub fn export(dest: &Path, pages: &[PageSpec], outline: Option<&Outline>) -> Res
     }
 
     for image in &images {
+        let filter = match image.compression {
+            Codec::Flate => "/FlateDecode",
+            Codec::Jpeg => "/DCTDecode",
+        };
         let mut body = format!(
-            "<< /Type /XObject /Subtype /Image /Width {} /Height {} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode /Length {} >>\nstream\n",
+            "<< /Type /XObject /Subtype /Image /Width {} /Height {} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter {} /Length {} >>\nstream\n",
             image.width,
             image.height,
+            filter,
             image.stream.len()
         )
         .into_bytes();
@@ -509,6 +549,47 @@ mod tests {
             .unwrap();
         assert!(bytes[offset..].starts_with(b"xref"));
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stores_jpeg_photos_as_jpeg() {
+        let dir = temp_dir("jpeg");
+        let img_path = dir.join("foto.jpg");
+        // A noisy block compresses far better as JPEG than as raw RGB.
+        let mut img = image::RgbImage::new(600, 600);
+        for (x, y, px) in img.enumerate_pixels_mut() {
+            let v = ((x * 7 + y * 13) % 256) as u8;
+            *px = image::Rgb([v, v.wrapping_mul(3), v.wrapping_add(17)]);
+        }
+        img.save_with_format(&img_path, image::ImageFormat::Jpeg)
+            .unwrap();
+
+        let dest = dir.join("foto.pdf");
+        export(
+            &dest,
+            &[PageSpec {
+                width_mm: 100.0,
+                height_mm: 100.0,
+                items: vec![Item {
+                    path: img_path,
+                    x_mm: 0.0,
+                    y_mm: 0.0,
+                    rotation: 0.0,
+                    art_x_mm: 0.0,
+                    art_y_mm: 0.0,
+                    art_w_mm: 50.8,
+                    art_h_mm: 50.8,
+                }],
+            }],
+            None,
+        )
+        .unwrap();
+
+        let bytes = fs::read(&dest).unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("/Filter /DCTDecode"));
+        assert!(!text.contains("/Filter /FlateDecode /Length"), "the photo must not be stored as Flate");
         let _ = fs::remove_dir_all(&dir);
     }
 

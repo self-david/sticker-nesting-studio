@@ -5,6 +5,7 @@ import type {
   AiReport,
   AiStatus,
   FacetCount,
+  ImportProgress,
   ImportReport,
   LibraryInfo,
   SortKey,
@@ -22,8 +23,21 @@ export function assetUrl(path: string): string {
   return convertFileSrc(path);
 }
 
-export function importPaths(paths: string[]): Promise<ImportReport> {
-  return invoke<ImportReport>("import_paths", { paths });
+export function importPaths(paths: string[], allowDuplicates = false): Promise<ImportReport> {
+  return invoke<ImportReport>("import_paths", { paths, allowDuplicates });
+}
+
+/** Stops the running import after the file it is working on. */
+export function cancelImport(): Promise<void> {
+  return invoke<void>("cancel_import");
+}
+
+/** Progress of the import: one event per file, off the UI thread. */
+export async function onImportProgress(
+  handler: (progress: ImportProgress) => void,
+): Promise<() => void> {
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<ImportProgress>("import:progress", (event) => handler(event.payload));
 }
 
 export function listStickers(query: string, tags: string[], sort: SortKey): Promise<Sticker[]> {

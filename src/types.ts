@@ -43,9 +43,26 @@ export interface ImportFailure {
   message: string;
 }
 
+export interface ImportDuplicate {
+  path: string;
+  /** Name the library already gives that artwork. */
+  name: string;
+  existingId: string;
+}
+
 export interface ImportReport {
   importedIds: string[];
   errors: ImportFailure[];
+  /** Files the library already had, skipped unless the user insists. */
+  duplicates: ImportDuplicate[];
+  cancelled: boolean;
+}
+
+export interface ImportProgress {
+  done: number;
+  total: number;
+  /** File being worked on; empty once the batch is over. */
+  name: string;
 }
 
 export interface LibraryInfo {

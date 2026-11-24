@@ -1,9 +1,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { FacetCount, LibraryInfo, SortKey, Sticker, TagCount } from "./types";
+import type {
+  FacetCount,
+  ImportProgress,
+  LibraryInfo,
+  SortKey,
+  Sticker,
+  TagCount,
+} from "./types";
 import {
   PROJECT_EXTENSION,
   aiClassify,
   aiDescribe,
+  cancelImport,
   deleteStickers,
   exportLibraryArchive,
   importLibraryArchive,
@@ -14,6 +22,7 @@ import {
   type ArchiveConflict,
   importPaths,
   isTauri,
+  onImportProgress,
   libraryInfo,
   recalcDpi,
   listSeries,
@@ -100,6 +109,7 @@ export default function App() {
   const [selection, setSelection] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [importing, setImporting] = useState(false);
+  const [importProgress, setImportProgress] = useState<ImportProgress | null>(null);
   const [dropping, setDropping] = useState(false);
   const [toast, setToast] = useState<Toast | null>(null);
   const [sheetCopies, setSheetCopies] = useState<SheetCopy[]>([]);
@@ -242,15 +252,44 @@ export default function App() {
   );
 
   const runImport = useCallback(
-    async (paths: string[]) => {
+    async (paths: string[], allowDuplicates = false) => {
       if (!paths.length || !isTauri) return;
       setImporting(true);
+      setImportProgress({ done: 0, total: paths.length, name: "" });
+      // Without the event bridge the import still runs; it just shows no ticks.
+      const stop = await onImportProgress(setImportProgress).catch(() => () => {});
       try {
-        const report = await importPaths(paths);
+        let report = await importPaths(paths, allowDuplicates);
+        // Files already in the library come back instead of being copied; the
+        // user chooses whether the second copy is wanted anyway.
+        if (!report.cancelled && report.duplicates.length > 0) {
+          const again = await confirmAction(
+            t("import.duplicatesAsk", { n: report.duplicates.length }),
+          );
+          if (again) {
+            const second = await importPaths(
+              report.duplicates.map((duplicate) => duplicate.path),
+              true,
+            );
+            report = {
+              importedIds: [...report.importedIds, ...second.importedIds],
+              errors: [...report.errors, ...second.errors],
+              duplicates: second.duplicates,
+              cancelled: second.cancelled,
+            };
+          }
+        }
         await reload();
         void refreshPending();
-        if (report.importedIds.length > 0) {
+        if (report.cancelled) {
+          setToast({ kind: "err", text: t("import.cancelled") });
+        } else if (report.importedIds.length > 0) {
           setToast({ kind: "ok", text: t("import.imported", { n: report.importedIds.length }) });
+        } else if (report.duplicates.length > 0) {
+          setToast({
+            kind: "ok",
+            text: t("import.duplicatesKept", { n: report.duplicates.length }),
+          });
         }
         if (report.errors.length > 0) {
           setToast({ kind: "err", text: t("import.someFailed", { n: report.errors.length }) });
@@ -259,10 +298,12 @@ export default function App() {
       } catch (err) {
         setToast({ kind: "err", text: String(err) });
       } finally {
+        stop();
         setImporting(false);
+        setImportProgress(null);
       }
     },
-    [reload, refreshPending, t],
+    [confirmAction, reload, refreshPending, t],
   );
 
   const handleImportClick = useCallback(async () => {
@@ -1013,6 +1054,17 @@ export default function App() {
                     <option value="size">{t("sort.size")}</option>
                   </select>
                 </label>
+                {importing && importProgress && (
+                  <span className="import-progress">
+                    {t("import.progress", {
+                      done: importProgress.done,
+                      total: importProgress.total,
+                    })}
+                    <button className="link-btn" onClick={() => void cancelImport()}>
+                      {t("import.cancel")}
+                    </button>
+                  </span>
+                )}
                 <button className="primary-btn" onClick={handleImportClick} disabled={importing || !isTauri}>
                   {importing ? t("import.busy") : t("import.button")}
                 </button>
