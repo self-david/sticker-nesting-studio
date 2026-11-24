@@ -15,6 +15,7 @@ import {
   importPaths,
   isTauri,
   libraryInfo,
+  recalcDpi,
   listSeries,
   listStickers,
   listTags,
@@ -122,6 +123,7 @@ export default function App() {
   const [seriesOpen, setSeriesOpen] = useState(false);
   const [merging, setMerging] = useState(false);
   const [archiveBusy, setArchiveBusy] = useState(false);
+  const [recalcBusy, setRecalcBusy] = useState(false);
   const [archivePeek, setArchivePeek] = useState<{
     path: string;
     total: number;
@@ -191,6 +193,34 @@ export default function App() {
   useEffect(() => {
     void refreshPending();
   }, [refreshPending]);
+
+  // Stickers imported before the density was read still carry the 300 dpi
+  // assumption; this asks the files what they really declare.
+  const recalcDensities = useCallback(async () => {
+    if (!isTauri || recalcBusy) return;
+    setRecalcBusy(true);
+    try {
+      const report = await recalcDpi();
+      await reload();
+      if (report.failures.length > 0) {
+        setToast({ kind: "err", text: t("library.recalcFailed", { n: report.failures.length }) });
+        return;
+      }
+      const fixed = report.updated + report.keptSize;
+      const done = t("library.recalcDone", { updated: fixed, checked: report.checked });
+      setToast({
+        kind: "ok",
+        text:
+          report.withoutDensity > 0
+            ? `${done} · ${t("library.recalcNoDensity", { n: report.withoutDensity })}`
+            : done,
+      });
+    } catch (err) {
+      setToast({ kind: "err", text: String(err) });
+    } finally {
+      setRecalcBusy(false);
+    }
+  }, [recalcBusy, reload, t]);
 
   useEffect(() => {
     if (!toast) return;
@@ -903,6 +933,8 @@ export default function App() {
         info={info}
         sheetCount={sheetCopies.length}
         onOpenFolder={() => void revealLibrary()}
+        onRecalcDpi={() => void recalcDensities()}
+        recalcBusy={recalcBusy}
         onExportLibrary={() => void exportArchive()}
         onImportLibrary={() => void startArchiveImport()}
         archiveBusy={archiveBusy}

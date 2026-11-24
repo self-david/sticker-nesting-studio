@@ -19,6 +19,9 @@ interface Props {
   info: LibraryInfo | null;
   sheetCount: number;
   onOpenFolder: () => void;
+  onRecalcDpi: () => void;
+  /** A density pass over the library is running. */
+  recalcBusy: boolean;
   onExportLibrary: () => void;
   onImportLibrary: () => void;
   /** A whole-library export or import is running. */
@@ -74,6 +77,8 @@ export function Sidebar({
   info,
   sheetCount,
   onOpenFolder,
+  onRecalcDpi,
+  recalcBusy,
   onExportLibrary,
   onImportLibrary,
   archiveBusy,
@@ -206,6 +211,14 @@ export function Sidebar({
             </div>
             <button className="ghost-btn" onClick={onOpenFolder}>
               {t("library.openFolder")}
+            </button>
+            <button
+              className="ghost-btn"
+              onClick={onRecalcDpi}
+              disabled={recalcBusy || info.count === 0}
+              title={t("library.recalcTitle")}
+            >
+              {recalcBusy ? t("library.recalcBusy") : t("library.recalc")}
             </button>
             <button
               className="ghost-btn"

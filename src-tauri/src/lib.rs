@@ -691,6 +691,29 @@ fn library_info(state: State<'_, AppState>) -> Result<LibraryInfo, String> {
     })
 }
 
+/// Reads the density of every raster sticker again, for the artwork imported
+/// before the app understood that a file can declare its own DPI. The files are
+/// read off the UI thread and the rows are written in one transaction.
+#[tauri::command]
+async fn recalc_dpi(state: State<'_, AppState>) -> Result<db::DpiReport, String> {
+    let rows = {
+        let conn = state.conn.lock().map_err(|e| e.to_string())?;
+        db::density_rows(&conn)?
+    };
+    if rows.is_empty() {
+        return Ok(db::DpiReport::default());
+    }
+    let files = state.root.join("files");
+    let plan = tauri::async_runtime::spawn_blocking(move || db::plan_densities(rows, &files))
+        .await
+        .map_err(|e| e.to_string())?;
+    if !plan.fixes.is_empty() {
+        let mut conn = state.conn.lock().map_err(|e| e.to_string())?;
+        db::apply_densities(&mut conn, &plan.fixes)?;
+    }
+    Ok(plan.report)
+}
+
 #[tauri::command]
 async fn sticker_contour(
     path: String,
@@ -958,6 +981,7 @@ pub fn run() {
             set_sticker_tags,
             delete_stickers,
             library_info,
+            recalc_dpi,
             sticker_contour,
             nest_sheet,
             export_sheet_pdf,

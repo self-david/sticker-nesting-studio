@@ -201,6 +201,24 @@ export function revealLibrary(): Promise<void> {
   return invoke("reveal_library");
 }
 
+/** What a density pass found across the library. */
+export interface DpiReport {
+  checked: number;
+  /** Size recomputed from the pixels and the newly read density. */
+  updated: number;
+  /** Hand-sized stickers: only their density changed. */
+  keptSize: number;
+  unchanged: number;
+  /** The file declares no density at all (WebP, PNG/JPG without metadata). */
+  withoutDensity: number;
+  failures: { name: string; message: string }[];
+}
+
+/** Reads the DPI of the already imported artwork again. */
+export function recalcDpi(): Promise<DpiReport> {
+  return invoke<DpiReport>("recalc_dpi");
+}
+
 export interface PdfExportItem {
   path: string;
   /** Top-left of the footprint on the page, the cut line included. */

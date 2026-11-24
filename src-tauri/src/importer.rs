@@ -259,6 +259,19 @@ fn exif_dpi(tiff: &[u8]) -> Option<f64> {
     Some(if unit == 3 { dpi * 2.54 } else { dpi })
 }
 
+/// Density within the range a sticker can sensibly carry, rounded to hundredths.
+fn sane_dpi(value: f64) -> f64 {
+    round2(value.clamp(30.0, 2400.0))
+}
+
+/// The density the file on disk declares. `None` means the artwork carries no
+/// physical size: WebP always, and PNG or JPEG without density metadata.
+/// Used to correct stickers imported before the density was read.
+pub fn declared_density(path: &Path, ext: &str) -> Result<Option<f64>, String> {
+    let bytes = fs::read(path).map_err(|e| format!("No se pudo leer la imagen: {e}"))?;
+    Ok(declared_dpi(&bytes, ext).map(sane_dpi))
+}
+
 pub fn probe(src: &Path, ext: &str, thumbs: &Path, id: &str) -> Result<Probe, String> {
     if ext == "svg" {
         let text = fs::read_to_string(src).map_err(|e| format!("No se pudo leer el SVG: {e}"))?;
@@ -290,11 +303,7 @@ pub fn probe(src: &Path, ext: &str, thumbs: &Path, id: &str) -> Result<Probe, St
     let has_alpha = img.color().has_alpha();
     // The file's own density when it declares a sane one; 300 dpi is only the
     // fallback for artwork that carries no physical size at all.
-    let dpi = round2(
-        declared_dpi(&bytes, ext)
-            .map(|value| value.clamp(30.0, 2400.0))
-            .unwrap_or(300.0),
-    );
+    let dpi = declared_dpi(&bytes, ext).map(sane_dpi).unwrap_or(300.0);
 
     let thumb = img.thumbnail(THUMB_MAX, THUMB_MAX);
     let thumb_ext = if has_alpha { "png" } else { "jpg" };

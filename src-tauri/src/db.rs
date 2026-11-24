@@ -1,3 +1,4 @@
+use crate::importer;
 use rusqlite::backup::Backup;
 use rusqlite::{params, params_from_iter, Connection};
 use serde::Serialize;
@@ -192,6 +193,160 @@ fn prune_backups(dir: &Path, keep: usize) {
     for name in names.into_iter().take(extra) {
         let _ = fs::remove_file(dir.join(name));
     }
+}
+
+// --- density of the artwork already in the library --------------------------
+
+/// One raster sticker as the density check needs it.
+pub struct DensityRow {
+    pub id: String,
+    pub name: String,
+    pub file_name: String,
+    pub ext: String,
+    pub width_px: f64,
+    pub height_px: f64,
+    pub width_mm: f64,
+    pub height_mm: f64,
+    pub dpi: f64,
+}
+
+/// A sticker whose density, and possibly its size, has to be rewritten.
+pub struct DensityFix {
+    pub id: String,
+    pub dpi: f64,
+    pub width_mm: f64,
+    pub height_mm: f64,
+}
+
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DpiReport {
+    /// Raster stickers looked at.
+    pub checked: usize,
+    /// Stickers whose size followed the old density and was recomputed.
+    pub updated: usize,
+    /// Hand-sized stickers: their millimetres stay, only the density moves.
+    pub kept_size: usize,
+    /// The file declares the density already stored.
+    pub unchanged: usize,
+    /// No density in the file (WebP, or PNG/JPEG without metadata).
+    pub without_density: usize,
+    pub failures: Vec<DpiFailure>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DpiFailure {
+    pub name: String,
+    pub message: String,
+}
+
+pub struct DensityPlan {
+    pub report: DpiReport,
+    pub fixes: Vec<DensityFix>,
+}
+
+/// Every raster sticker, oldest first.
+pub fn density_rows(conn: &Connection) -> Result<Vec<DensityRow>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, name, file_name, ext, width_px, height_px, width_mm, height_mm, dpi
+             FROM stickers WHERE kind = 'raster' ORDER BY created_at",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(DensityRow {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                file_name: r.get(2)?,
+                ext: r.get(3)?,
+                width_px: r.get(4)?,
+                height_px: r.get(5)?,
+                width_mm: r.get(6)?,
+                height_mm: r.get(7)?,
+                dpi: r.get(8)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| e.to_string())
+}
+
+/// Reads the density each file declares and works out the new values. Nothing
+/// is written here, so the files can be read off the UI thread.
+pub fn plan_densities(rows: Vec<DensityRow>, files: &Path) -> DensityPlan {
+    let mut plan = DensityPlan {
+        report: DpiReport::default(),
+        fixes: Vec::new(),
+    };
+    for row in rows {
+        plan.report.checked += 1;
+        let ext = row.ext.to_ascii_lowercase();
+        let density = match importer::declared_density(&files.join(&row.file_name), &ext) {
+            Ok(Some(value)) => value,
+            Ok(None) => {
+                plan.report.without_density += 1;
+                continue;
+            }
+            Err(message) => {
+                plan.report.failures.push(DpiFailure {
+                    name: row.name,
+                    message,
+                });
+                continue;
+            }
+        };
+        if (density - row.dpi).abs() < 0.01 {
+            plan.report.unchanged += 1;
+            continue;
+        }
+        // A size typed in the panel is kept: only the density it was measured
+        // against changes. A size that still follows the stored density came
+        // from the pixels, so it is safe to recompute.
+        let derived = row.dpi > 0.0
+            && row.width_px > 0.0
+            && row.height_px > 0.0
+            && (row.width_mm - row.width_px * 25.4 / row.dpi).abs() < 0.05
+            && (row.height_mm - row.height_px * 25.4 / row.dpi).abs() < 0.05;
+        if derived {
+            plan.report.updated += 1;
+        } else {
+            plan.report.kept_size += 1;
+        }
+        plan.fixes.push(DensityFix {
+            id: row.id,
+            dpi: density,
+            width_mm: if derived {
+                round_mm(row.width_px * 25.4 / density)
+            } else {
+                row.width_mm
+            },
+            height_mm: if derived {
+                round_mm(row.height_px * 25.4 / density)
+            } else {
+                row.height_mm
+            },
+        });
+    }
+    plan
+}
+
+/// Writes every fix in one transaction, so a failure leaves the library as it was.
+pub fn apply_densities(conn: &mut Connection, fixes: &[DensityFix]) -> Result<(), String> {
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    for fix in fixes {
+        tx.execute(
+            "UPDATE stickers SET dpi = ?1, width_mm = ?2, height_mm = ?3 WHERE id = ?4",
+            params![fix.dpi, fix.width_mm, fix.height_mm, fix.id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())
+}
+
+fn round_mm(v: f64) -> f64 {
+    (v * 100.0).round() / 100.0
 }
 
 pub fn normalize_tag(raw: &str) -> Option<String> {
@@ -1087,6 +1242,63 @@ mod tests {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(10_957), (2000, 1, 1));
         assert_eq!(civil_from_days(19_782), (2024, 2, 29));
+    }
+
+    /// PNG signature plus a `pHYs` chunk: enough for the density reader.
+    fn png_declaring(ppm: u32) -> Vec<u8> {
+        let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        bytes.extend_from_slice(&9u32.to_be_bytes());
+        bytes.extend_from_slice(b"pHYs");
+        bytes.extend_from_slice(&ppm.to_be_bytes());
+        bytes.extend_from_slice(&ppm.to_be_bytes());
+        bytes.push(1);
+        bytes.extend_from_slice(&[0, 0, 0, 0]);
+        bytes
+    }
+
+    #[test]
+    fn recalculating_reads_the_density_each_file_declares() {
+        let dir = std::env::temp_dir().join(format!("sns-dpi-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("files")).unwrap();
+        let mut conn = library();
+        let files = dir.join("files");
+        // The fixture measures 100 px at 300 dpi; make its size follow that, as
+        // an imported sticker does.
+        conn.execute("UPDATE stickers SET width_mm = 8.47, height_mm = 8.47 WHERE id = 'a'", [])
+            .unwrap();
+
+        // 5906 px/m is 150 dpi: the 100 px sticker is 16.93 mm, not 8.47.
+        std::fs::write(files.join("a.png"), png_declaring(5906)).unwrap();
+        let plan = plan_densities(density_rows(&conn).unwrap(), &files);
+        assert_eq!(plan.report.checked, 1);
+        assert_eq!(plan.report.updated, 1);
+        assert_eq!(plan.report.kept_size, 0);
+        // 5906 px/m is 150.01 dpi once converted and rounded.
+        assert!((plan.fixes[0].dpi - 150.0).abs() < 0.05);
+        apply_densities(&mut conn, &plan.fixes).unwrap();
+        let stored = list(&conn, &dir, "", &[], "recent").unwrap();
+        assert!((stored[0].width_mm - 16.93).abs() < 0.01);
+        assert!((stored[0].dpi - 150.0).abs() < 0.05);
+
+        // A size set by hand stays; only the density is corrected.
+        conn.execute("UPDATE stickers SET width_mm = 40, height_mm = 40 WHERE id = 'a'", [])
+            .unwrap();
+        std::fs::write(files.join("a.png"), png_declaring(11811)).unwrap();
+        let plan = plan_densities(density_rows(&conn).unwrap(), &files);
+        assert_eq!(plan.report.kept_size, 1);
+        assert_eq!(plan.report.updated, 0);
+        apply_densities(&mut conn, &plan.fixes).unwrap();
+        let stored = list(&conn, &dir, "", &[], "recent").unwrap();
+        assert!((stored[0].width_mm - 40.0).abs() < 1e-6);
+        assert!((stored[0].dpi - 300.0).abs() < 1e-6);
+
+        // A file without density is left alone.
+        std::fs::write(files.join("a.png"), b"not a png").unwrap();
+        let plan = plan_densities(density_rows(&conn).unwrap(), &files);
+        assert_eq!(plan.report.without_density, 1);
+        assert!(plan.fixes.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
