@@ -368,6 +368,84 @@ fn round_mm(v: f64) -> f64 {
     (v * 100.0).round() / 100.0
 }
 
+/// One row as the storage pass sees it: where the artwork lives and what the
+/// file is supposed to be.
+pub struct ArtworkRow {
+    pub id: String,
+    pub name: String,
+    pub file_name: String,
+    pub ext: String,
+    pub kind: String,
+    pub width_px: f64,
+    pub height_px: f64,
+    pub dpi: f64,
+    pub has_alpha: bool,
+}
+
+/// Where a sticker's artwork ended up after the pass, and how big it is now.
+pub struct ArtworkUpdate {
+    pub id: String,
+    pub file_name: String,
+    pub ext: String,
+    pub kind: String,
+    pub width_px: f64,
+    pub height_px: f64,
+    pub dpi: f64,
+    pub has_alpha: bool,
+    pub size_bytes: i64,
+}
+
+pub fn artwork_rows(conn: &Connection) -> Result<Vec<ArtworkRow>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, name, file_name, ext, kind, width_px, height_px, dpi, has_alpha
+             FROM stickers ORDER BY created_at",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(ArtworkRow {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                file_name: r.get(2)?,
+                ext: r.get(3)?,
+                kind: r.get(4)?,
+                width_px: r.get(5)?,
+                height_px: r.get(6)?,
+                dpi: r.get(7)?,
+                has_alpha: r.get::<_, i64>(8)? != 0,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| e.to_string())
+}
+
+/// Writes every artwork change in one transaction, so a failure leaves the
+/// library pointing at the files it still has.
+pub fn apply_artwork(conn: &mut Connection, updates: &[ArtworkUpdate]) -> Result<(), String> {
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    for update in updates {
+        tx.execute(
+            "UPDATE stickers SET file_name = ?2, ext = ?3, kind = ?4, width_px = ?5, \
+             height_px = ?6, dpi = ?7, has_alpha = ?8, size_bytes = ?9 WHERE id = ?1",
+            params![
+                update.id,
+                update.file_name,
+                update.ext,
+                update.kind,
+                update.width_px,
+                update.height_px,
+                update.dpi,
+                if update.has_alpha { 1 } else { 0 },
+                update.size_bytes,
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())
+}
+
 pub fn normalize_tag(raw: &str) -> Option<String> {
     let tag = raw.trim().to_lowercase().replace(',', " ");
     let tag = tag.split_whitespace().collect::<Vec<_>>().join(" ");

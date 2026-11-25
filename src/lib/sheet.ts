@@ -21,6 +21,10 @@ export interface SheetSettings {
   cutLines: boolean;
   outlineWidthMm: number;
   outlinePadMm: number;
+  /** Colour of the border drawn around each sticker, and of its cut line. */
+  outlineColor: string;
+  /** Fill inside that border; "" leaves the artwork's transparency alone. */
+  stickerBg: string;
   /** Page width used when `paper` is "custom", in millimetres. */
   customWidthMm: number;
   /** Page height used when `paper` is "custom", in millimetres. */
@@ -40,10 +44,26 @@ export const DEFAULT_SETTINGS: SheetSettings = {
   cutLines: true,
   outlineWidthMm: 0.3,
   outlinePadMm: 1.5,
+  outlineColor: "#000000",
+  stickerBg: "",
   customWidthMm: 210,
   customHeightMm: 297,
   areaCm2: 0,
 };
+
+/** Border colour a sheet starts with. */
+export const DEFAULT_BORDER_COLOR = "#000000";
+
+/** `#rgb` or `#rrggbb` as `#rrggbb`; anything else falls back. */
+export function normalizeColor(raw: unknown, fallback: string): string {
+  if (typeof raw !== "string") return fallback;
+  const value = raw.trim().toLowerCase();
+  if (/^#[0-9a-f]{6}$/.test(value)) return value;
+  if (/^#[0-9a-f]{3}$/.test(value)) {
+    return `#${value[1]}${value[1]}${value[2]}${value[2]}${value[3]}${value[3]}`;
+  }
+  return fallback;
+}
 
 /** Largest area the size field accepts, in cm². */
 export const MAX_AREA_CM2 = 2000;

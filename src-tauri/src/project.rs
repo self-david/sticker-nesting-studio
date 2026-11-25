@@ -32,6 +32,12 @@ pub struct ProjectSettings {
     pub cut_lines: bool,
     pub outline_width_mm: f64,
     pub outline_pad_mm: f64,
+    /// Border colour written by the sheet; older files get black.
+    #[serde(default = "default_border_color")]
+    pub outline_color: String,
+    /// Fill inside the border. Empty means no fill; older files get none.
+    #[serde(default)]
+    pub sticker_bg: String,
     /// Page size used when `paper` is "custom"; older files leave it out.
     #[serde(default = "default_page_w")]
     pub custom_width_mm: f64,
@@ -40,6 +46,10 @@ pub struct ProjectSettings {
     /// Area given to new copies, in cm²; 0 keeps the real size.
     #[serde(default)]
     pub area_cm2: f64,
+}
+
+fn default_border_color() -> String {
+    "#000000".to_string()
 }
 
 fn default_page_w() -> f64 {
@@ -344,6 +354,10 @@ fn sanitize_settings(mut settings: ProjectSettings) -> ProjectSettings {
     settings.gap_mm = settings.gap_mm.clamp(0.0, 30.0);
     settings.outline_width_mm = settings.outline_width_mm.clamp(0.05, 5.0);
     settings.outline_pad_mm = settings.outline_pad_mm.clamp(0.0, 30.0);
+    settings.outline_color = crate::pdf::normalize_hex(&settings.outline_color)
+        .unwrap_or_else(|| "#000000".to_string());
+    // An unreadable fill is the same as asking for no fill.
+    settings.sticker_bg = crate::pdf::normalize_hex(&settings.sticker_bg).unwrap_or_default();
     settings
 }
 
@@ -726,6 +740,8 @@ mod tests {
             cut_lines: true,
             outline_width_mm: 0.3,
             outline_pad_mm: 1.5,
+            outline_color: "#000000".into(),
+            sticker_bg: String::new(),
             custom_width_mm: 210.0,
             custom_height_mm: 297.0,
             area_cm2: 0.0,

@@ -22,6 +22,9 @@ interface Props {
   onRecalcDpi: () => void;
   /** A density pass over the library is running. */
   recalcBusy: boolean;
+  /** Recompresses the stored artwork and converts any SVG left. */
+  onOptimize: () => void;
+  optimizeBusy: boolean;
   onExportLibrary: () => void;
   onImportLibrary: () => void;
   /** A whole-library export or import is running. */
@@ -79,6 +82,8 @@ export function Sidebar({
   onOpenFolder,
   onRecalcDpi,
   recalcBusy,
+  onOptimize,
+  optimizeBusy,
   onExportLibrary,
   onImportLibrary,
   archiveBusy,
@@ -219,6 +224,14 @@ export function Sidebar({
               title={t("library.recalcTitle")}
             >
               {recalcBusy ? t("library.recalcBusy") : t("library.recalc")}
+            </button>
+            <button
+              className="ghost-btn"
+              onClick={onOptimize}
+              disabled={optimizeBusy || info.count === 0}
+              title={t("library.optimizeTitle")}
+            >
+              {optimizeBusy ? t("library.optimizeBusy") : t("library.optimize")}
             </button>
             <button
               className="ghost-btn"

@@ -240,6 +240,23 @@ export function revealLibrary(): Promise<void> {
   return invoke("reveal_library");
 }
 
+/** What the lossless storage pass found across the library. */
+export interface OptimizeReport {
+  checked: number;
+  /** SVGs baked into PNGs. */
+  converted: number;
+  /** PNGs whose stream got smaller. */
+  compressed: number;
+  bytesBefore: number;
+  bytesAfter: number;
+  failures: { name: string; message: string }[];
+}
+
+/** Recompresses every stored PNG and turns old SVGs into PNGs. */
+export function optimizeLibraryImages(): Promise<OptimizeReport> {
+  return invoke<OptimizeReport>("optimize_library");
+}
+
 /** What a density pass found across the library. */
 export interface DpiReport {
   checked: number;
@@ -294,6 +311,8 @@ export function exportSheetPdf(
   cutLines: boolean,
   outlineWidthMm: number,
   outlinePaddingMm: number,
+  outlineColor: string,
+  stickerBg: string,
 ): Promise<string> {
   return invoke<string>("export_sheet_pdf", {
     path,
@@ -301,6 +320,8 @@ export function exportSheetPdf(
     cutLines,
     outlineWidthMm,
     outlinePaddingMm,
+    outlineColor,
+    stickerBg,
   });
 }
 

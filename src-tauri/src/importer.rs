@@ -346,6 +346,38 @@ fn round2(v: f64) -> f64 {
     (v * 100.0).round() / 100.0
 }
 
+/// Rebuilds the preview of an artwork that is already stored, without touching
+/// the artwork itself: the storage pass needs a preview for an SVG it just
+/// turned into a PNG, and it must not trim the file a second time.
+pub fn thumbnail(path: &Path, thumbs: &Path, id: &str) -> Result<(u32, u32, bool), String> {
+    let img = image::open(path).map_err(|e| format!("No se pudo abrir la imagen: {e}"))?;
+    let has_alpha = img.color().has_alpha();
+    let (w, h) = img.dimensions();
+    if w == 0 || h == 0 {
+        return Err("La imagen está vacía".into());
+    }
+    let thumb = if w > THUMB_MAX || h > THUMB_MAX {
+        img.thumbnail(THUMB_MAX, THUMB_MAX)
+    } else {
+        img
+    };
+    let thumb_ext = if has_alpha { "png" } else { "jpg" };
+    let thumb_path = thumbs.join(format!("{id}.{thumb_ext}"));
+    // The other format would keep being served by the library view.
+    let other = if has_alpha { "jpg" } else { "png" };
+    let _ = fs::remove_file(thumbs.join(format!("{id}.{other}")));
+    if has_alpha {
+        thumb
+            .save_with_format(&thumb_path, image::ImageFormat::Png)
+            .map_err(|e| format!("No se pudo crear la miniatura: {e}"))?;
+    } else {
+        thumb
+            .save_with_format(&thumb_path, image::ImageFormat::Jpeg)
+            .map_err(|e| format!("No se pudo crear la miniatura: {e}"))?;
+    }
+    Ok((w, h, has_alpha))
+}
+
 pub fn sanitize_name(raw: &str) -> String {
     let cleaned: String = raw
         .chars()

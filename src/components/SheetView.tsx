@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { Sticker } from "../types";
 import type { SheetCopy, SheetSettings } from "../lib/sheet";
 import {
+  DEFAULT_BORDER_COLOR,
   MAX_AREA_CM2,
   MAX_PAPER_MM,
   MAX_SIZE_MM,
@@ -9,6 +10,7 @@ import {
   MIN_SIZE_MM,
   clamp,
   maxMarginMm,
+  normalizeColor,
   pageDimensions,
   sheetFileName,
 } from "../lib/sheet";
@@ -392,6 +394,8 @@ export function SheetView({
         settings.cutLines,
         settings.outlineWidthMm,
         settings.outlinePadMm,
+        settings.outlineColor,
+        settings.stickerBg,
       );
       onNotify(t("sheet.exported", { path: saved, n: exportPages.length }), "ok");
     } catch (err) {
@@ -533,6 +537,23 @@ export function SheetView({
                         transform: `rotate(${p.rotation}deg)`,
                       }}
                     >
+                      {shape && settings.stickerBg !== "" && (
+                        <svg
+                          className="sheet-outline sheet-sticker-bg"
+                          viewBox="0 0 1 1"
+                          preserveAspectRatio="none"
+                          aria-hidden="true"
+                          style={{ inset: 0, width: "100%", height: "100%" }}
+                        >
+                          {shape.map((polygon, i) => (
+                            <path
+                              key={i}
+                              d={polygonPath(polygon)}
+                              style={{ fill: settings.stickerBg, stroke: "none" }}
+                            />
+                          ))}
+                        </svg>
+                      )}
                       <Thumb
                         src={assetUrl(p.copy.thumbPath)}
                         ext={p.copy.ext}
@@ -557,6 +578,7 @@ export function SheetView({
                               d={polygonPath(polygon)}
                               vectorEffect="non-scaling-stroke"
                               strokeWidth={Math.max(0.7, settings.outlineWidthMm * scale)}
+                              style={{ stroke: settings.outlineColor }}
                             />
                           ))}
                         </svg>
@@ -768,6 +790,48 @@ export function SheetView({
                     />
                     <span className="unit">{t("unit.mm")}</span>
                   </div>
+                </label>
+              </div>
+            )}
+
+            {settings.cutLines && (
+              <div className="sheet-two">
+                <label className="sheet-field">
+                  <span className="field-label">{t("sheet.outlineColor")}</span>
+                  <input
+                    className="color-input"
+                    type="color"
+                    value={settings.outlineColor}
+                    aria-label={t("sheet.outlineColor")}
+                    onChange={(event) =>
+                      onSettings({
+                        outlineColor: normalizeColor(event.target.value, DEFAULT_BORDER_COLOR),
+                      })
+                    }
+                  />
+                </label>
+                <label className="sheet-field">
+                  <span className="field-label">{t("sheet.stickerBg")}</span>
+                  <span className="color-row">
+                    <input
+                      type="checkbox"
+                      checked={settings.stickerBg !== ""}
+                      aria-label={t("sheet.stickerBgOn")}
+                      onChange={(event) =>
+                        onSettings({ stickerBg: event.target.checked ? "#ffffff" : "" })
+                      }
+                    />
+                    <input
+                      className="color-input"
+                      type="color"
+                      value={settings.stickerBg || "#ffffff"}
+                      disabled={settings.stickerBg === ""}
+                      aria-label={t("sheet.stickerBg")}
+                      onChange={(event) =>
+                        onSettings({ stickerBg: normalizeColor(event.target.value, "#ffffff") })
+                      }
+                    />
+                  </span>
                 </label>
               </div>
             )}

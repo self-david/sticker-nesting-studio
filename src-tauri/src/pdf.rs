@@ -38,10 +38,49 @@ pub struct PageSpec {
     pub items: Vec<Item>,
 }
 
+/// Colour components in 0..1, the way PDF stores them.
+pub type Rgb = [f32; 3];
+
+/// `#rgb` or `#rrggbb` as PDF components. Anything else is not a colour.
+pub fn color_from_hex(raw: &str) -> Option<Rgb> {
+    let value = raw.trim().trim_start_matches('#');
+    let byte = |c: u8| c as f32 / 255.0;
+    match value.len() {
+        3 => {
+            let mut out = [0.0; 3];
+            for (i, c) in value.chars().enumerate() {
+                out[i] = byte((c.to_digit(16)? as u8) * 17);
+            }
+            Some(out)
+        }
+        6 => {
+            let channel = |at: usize| u8::from_str_radix(&value[at..at + 2], 16).ok().map(byte);
+            Some([channel(0)?, channel(2)?, channel(4)?])
+        }
+        _ => None,
+    }
+}
+
+/// Same colour, written as `#rrggbb`: what the sheet stores and shows.
+pub fn normalize_hex(raw: &str) -> Option<String> {
+    let rgb = color_from_hex(raw)?;
+    Some(format!(
+        "#{:02x}{:02x}{:02x}",
+        (rgb[0] * 255.0).round() as u8,
+        (rgb[1] * 255.0).round() as u8,
+        (rgb[2] * 255.0).round() as u8
+    ))
+}
+
 /// Cut outline drawn around each sticker's silhouette.
 pub struct Outline {
     pub width_mm: f64,
     pub padding_mm: f64,
+    /// Border colour; black unless the sheet says otherwise.
+    pub color: Rgb,
+    /// Fill inside that border, under the artwork. `None` leaves the
+    /// transparent parts of the artwork see-through.
+    pub fill: Option<Rgb>,
 }
 
 /// How the pixels travel into the PDF. Flate is lossless and right for flat
@@ -407,6 +446,78 @@ pub fn export(dest: &Path, pages: &[PageSpec], outline: Option<&Outline>) -> Res
         let height_pt = mm_to_pt(page.height_mm);
 
         let mut content = String::new();
+
+        // The silhouette is traced once per page: the fill under the artwork
+        // and the border around it must follow exactly the same line.
+        let mut outline_paths: Vec<(usize, String)> = Vec::new();
+        if let Some(outline) = outline {
+            for (index, item) in page.items.iter().enumerate() {
+                let Some(source) = sources.get(&key_of(&item.path)) else {
+                    continue;
+                };
+                if !item.has_art() {
+                    continue;
+                }
+                let (w_mm, h_mm) = fit_inside(item.art_w_mm, item.art_h_mm, source.aspect);
+                let cache_key = format!(
+                    "{}|{w_mm:.3}x{h_mm:.3}|{:.2}",
+                    key_of(&item.path),
+                    outline.padding_mm
+                );
+                shapes.entry(cache_key.clone()).or_insert_with(|| {
+                    contour::shape_from_file(&item.path, w_mm, h_mm, outline.padding_mm)
+                        .unwrap_or_else(|_| contour::Shape::rectangle())
+                });
+                outline_paths.push((index, cache_key));
+            }
+        }
+
+        let emit_outline = |content: &mut String| {
+            for (index, key) in &outline_paths {
+                let item = &page.items[*index];
+                let Some(source) = sources.get(&key_of(&item.path)) else {
+                    continue;
+                };
+                let Some(shape) = shapes.get(key) else {
+                    continue;
+                };
+                let (w_mm, h_mm) = fit_inside(item.art_w_mm, item.art_h_mm, source.aspect);
+                let (cx, cy, cos, sin) = item_transform(item, page.height_mm);
+                let art_w = mm_to_pt(w_mm);
+                let art_h = mm_to_pt(h_mm);
+                for polygon in &shape.contours {
+                    if polygon.len() < 2 {
+                        continue;
+                    }
+                    for (i, (nx, ny)) in polygon.iter().enumerate() {
+                        // Artwork-local point, y up, relative to the art centre.
+                        let lx = nx * art_w - art_w / 2.0;
+                        let ly = art_h / 2.0 - ny * art_h;
+                        let px = cx + cos * lx + sin * ly;
+                        let py = cy - sin * lx + cos * ly;
+                        content.push_str(&format!(
+                            "{px:.4} {py:.4} {}\n",
+                            if i == 0 { "m" } else { "l" }
+                        ));
+                    }
+                    content.push_str("h\n");
+                }
+            }
+        };
+
+        if let Some(fill) = outline.and_then(|outline| outline.fill) {
+            if !outline_paths.is_empty() {
+                // Painted before the artwork: what the PNG leaves transparent
+                // shows the sticker's own background, not the paper.
+                content.push_str(&format!(
+                    "{:.4} {:.4} {:.4} rg\n",
+                    fill[0], fill[1], fill[2]
+                ));
+                emit_outline(&mut content);
+                content.push_str("f\n");
+            }
+        }
+
         for item in &page.items {
             let Some(source) = sources.get(&key_of(&item.path)) else {
                 continue;
@@ -433,55 +544,17 @@ pub fn export(dest: &Path, pages: &[PageSpec], outline: Option<&Outline>) -> Res
         }
 
         if let Some(outline) = outline {
-            // One continuous line, so the cut follows the sticker without a
-            // dash pattern restarting on every contour.
-            content.push_str(&format!(
-                "{:.4} w 0.55 0.55 0.55 RG\n",
-                mm_to_pt(outline.width_mm.max(0.05))
-            ));
-            let mut stroked = false;
-            for item in &page.items {
-                let Some(source) = sources.get(&key_of(&item.path)) else {
-                    continue;
-                };
-                if !item.has_art() {
-                    continue;
-                }
-                let (w_mm, h_mm) = fit_inside(item.art_w_mm, item.art_h_mm, source.aspect);
-                let (cx, cy, cos, sin) = item_transform(item, page.height_mm);
-                let art_w = mm_to_pt(w_mm);
-                let art_h = mm_to_pt(h_mm);
-
-                let cache_key = format!(
-                    "{}|{w_mm:.3}x{h_mm:.3}|{:.2}",
-                    key_of(&item.path),
-                    outline.padding_mm
-                );
-                let shape = shapes.entry(cache_key).or_insert_with(|| {
-                    contour::shape_from_file(&item.path, w_mm, h_mm, outline.padding_mm)
-                        .unwrap_or_else(|_| contour::Shape::rectangle())
-                });
-
-                for polygon in &shape.contours {
-                    if polygon.len() < 2 {
-                        continue;
-                    }
-                    for (i, (nx, ny)) in polygon.iter().enumerate() {
-                        // Artwork-local point, y up, relative to the art centre.
-                        let lx = nx * art_w - art_w / 2.0;
-                        let ly = art_h / 2.0 - ny * art_h;
-                        let px = cx + cos * lx + sin * ly;
-                        let py = cy - sin * lx + cos * ly;
-                        content.push_str(&format!(
-                            "{px:.4} {py:.4} {}\n",
-                            if i == 0 { "m" } else { "l" }
-                        ));
-                    }
-                    content.push_str("h\n");
-                    stroked = true;
-                }
-            }
-            if stroked {
+            if !outline_paths.is_empty() {
+                // One continuous line, so the border follows the sticker
+                // without a dash pattern restarting on every contour.
+                content.push_str(&format!(
+                    "{:.4} w {:.4} {:.4} {:.4} RG\n",
+                    mm_to_pt(outline.width_mm.max(0.05)),
+                    outline.color[0],
+                    outline.color[1],
+                    outline.color[2]
+                ));
+                emit_outline(&mut content);
                 content.push_str("S\n");
             }
         }
@@ -831,6 +904,8 @@ mod tests {
             Some(&Outline {
                 width_mm: 0.3,
                 padding_mm: 1.0,
+                color: color_from_hex("#000000").unwrap(),
+                fill: color_from_hex("#ffffff"),
             }),
         )
         .unwrap();
@@ -840,6 +915,18 @@ mod tests {
         assert!(text.contains(" m\n"), "outline path should start with a move");
         assert!(text.matches(" l\n").count() > 12, "outline should have many segments");
         assert!(text.contains("h\nS\n"), "outline path should be stroked");
+        // The background covers the silhouette first, then the black border.
+        assert!(text.contains("1.0000 1.0000 1.0000 rg\n"));
+        assert!(text.contains("0.0000 0.0000 0.0000 RG\n"));
+        assert!(text.contains("f\n"));
+        assert!(
+            text.find(" rg\n").unwrap() < text.find(" Do\n").unwrap(),
+            "the background must be painted under the artwork"
+        );
+        assert!(
+            text.find(" rg\n").unwrap() < text.find("RG\n").unwrap(),
+            "the background must be painted under the border"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -24,6 +24,7 @@ import {
   isTauri,
   onImportProgress,
   libraryInfo,
+  optimizeLibraryImages,
   recalcDpi,
   listSeries,
   listStickers,
@@ -49,6 +50,7 @@ import {
   updateSticker,
 } from "./lib/api";
 import { useI18n } from "./lib/i18n";
+import { fmtBytes } from "./lib/format";
 import { filterStickers, parseQuery } from "./lib/search";
 import { groupStickers, visualOrder, type GroupBy } from "./lib/group";
 import {
@@ -134,6 +136,7 @@ export default function App() {
   const [merging, setMerging] = useState(false);
   const [archiveBusy, setArchiveBusy] = useState(false);
   const [recalcBusy, setRecalcBusy] = useState(false);
+  const [optimizeBusy, setOptimizeBusy] = useState(false);
   const [archivePeek, setArchivePeek] = useState<{
     path: string;
     total: number;
@@ -231,6 +234,37 @@ export default function App() {
       setRecalcBusy(false);
     }
   }, [recalcBusy, reload, t]);
+
+  // One explicit pass over the stored artwork: lossless for PNG, and the SVGs
+  // left by older libraries become PNGs so the sheet never renders a vector.
+  const optimizeArtwork = useCallback(async () => {
+    if (!isTauri || optimizeBusy) return;
+    setOptimizeBusy(true);
+    try {
+      const report = await optimizeLibraryImages();
+      await reload();
+      if (report.failures.length > 0) {
+        setToast({ kind: "err", text: t("library.optimizeFailed", { n: report.failures.length }) });
+        return;
+      }
+      const saved = fmtBytes(Math.max(0, report.bytesBefore - report.bytesAfter));
+      const done = t("library.optimizeDone", {
+        n: report.compressed + report.converted,
+        saved,
+      });
+      setToast({
+        kind: "ok",
+        text:
+          report.converted > 0
+            ? `${done} · ${t("library.optimizeConverted", { n: report.converted })}`
+            : done,
+      });
+    } catch (err) {
+      setToast({ kind: "err", text: String(err) });
+    } finally {
+      setOptimizeBusy(false);
+    }
+  }, [optimizeBusy, reload, t]);
 
   useEffect(() => {
     if (!toast) return;
@@ -973,6 +1007,8 @@ export default function App() {
         onOpenFolder={() => void revealLibrary()}
         onRecalcDpi={() => void recalcDensities()}
         recalcBusy={recalcBusy}
+        onOptimize={() => void optimizeArtwork()}
+        optimizeBusy={optimizeBusy}
         onExportLibrary={() => void exportArchive()}
         onImportLibrary={() => void startArchiveImport()}
         archiveBusy={archiveBusy}

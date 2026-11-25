@@ -4,6 +4,7 @@ mod contour;
 mod db;
 mod importer;
 mod nest;
+mod optimize;
 mod pdf;
 mod project;
 
@@ -192,8 +193,20 @@ fn prepare_batch(
         }
 
         let id = uuid::Uuid::new_v4().to_string();
-        let dest = importer::target_file(&files, &id, &ext);
-        if let Err(e) = fs::write(&dest, &bytes) {
+        // An SVG is rasterised once, at print resolution, and stored as PNG:
+        // the sheet then never has to render a vector again.
+        let (stored_bytes, stored_ext) = match optimize::prepare_bytes(&bytes, &ext) {
+            Ok(value) => value,
+            Err(message) => {
+                batch.errors.push(ImportFailure {
+                    path: raw,
+                    message,
+                });
+                continue;
+            }
+        };
+        let dest = importer::target_file(&files, &id, &stored_ext);
+        if let Err(e) = fs::write(&dest, &stored_bytes) {
             batch.errors.push(ImportFailure {
                 path: raw,
                 message: format!("No se pudo copiar: {e}"),
@@ -201,8 +214,15 @@ fn prepare_batch(
             continue;
         }
 
-        match importer::probe(&dest, &ext, &thumbs, &id) {
+        match importer::probe(&dest, &stored_ext, &thumbs, &id) {
             Ok(probe) => {
+                // After the trim: the stored bytes are the tight ones.
+                if stored_ext == "png" {
+                    let _ = optimize::optimize_file(&dest);
+                    if probe.has_alpha {
+                        let _ = optimize::optimize_file(&thumbs.join(format!("{id}.png")));
+                    }
+                }
                 let stem = src
                     .file_stem()
                     .map(|s| s.to_string_lossy().to_string())
@@ -219,7 +239,7 @@ fn prepare_batch(
                     source: raw,
                     name: clean,
                     file_name,
-                    ext: ext.clone(),
+                    ext: stored_ext,
                     hash,
                     probe,
                     size_bytes,
@@ -1020,6 +1040,32 @@ fn library_info(state: State<'_, AppState>) -> Result<LibraryInfo, String> {
     })
 }
 
+/// Applies the storage rules to everything the library already holds: every
+/// PNG is recompressed with oxipng and any SVG left from an older library is
+/// baked into a PNG. Files are processed off the UI thread; the rows change in
+/// one transaction once every file has been written.
+#[tauri::command]
+async fn optimize_library(state: State<'_, AppState>) -> Result<optimize::SweepReport, String> {
+    let rows = {
+        let conn = state.conn.lock().map_err(|e| e.to_string())?;
+        db::artwork_rows(&conn)?
+    };
+    if rows.is_empty() {
+        return Ok(optimize::SweepReport::default());
+    }
+    let files = state.root.join("files");
+    let thumbs = state.root.join("thumbs");
+    let sweep =
+        tauri::async_runtime::spawn_blocking(move || optimize::sweep(&files, &thumbs, rows))
+            .await
+            .map_err(|e| e.to_string())?;
+    if !sweep.updates.is_empty() {
+        let mut conn = state.conn.lock().map_err(|e| e.to_string())?;
+        db::apply_artwork(&mut conn, &sweep.updates)?;
+    }
+    Ok(sweep.report)
+}
+
 /// Reads the density of every raster sticker again, for the artwork imported
 /// before the app understood that a file can declare its own DPI. The files are
 /// read off the UI thread and the rows are written in one transaction.
@@ -1099,6 +1145,8 @@ async fn export_sheet_pdf(
     cut_lines: bool,
     outline_width_mm: f64,
     outline_padding_mm: f64,
+    outline_color: Option<String>,
+    sticker_bg: Option<String>,
 ) -> Result<String, String> {
     if path.trim().is_empty() {
         return Err("Falta la ruta de destino del PDF".into());
@@ -1132,6 +1180,13 @@ async fn export_sheet_pdf(
     let outline = cut_lines.then(|| pdf::Outline {
         width_mm: outline_width_mm.clamp(0.05, 5.0),
         padding_mm: outline_padding_mm.clamp(0.0, 30.0),
+        // Black is the default the sheet ships with; an unreadable value
+        // falls back to it instead of dropping the border.
+        color: outline_color
+            .as_deref()
+            .and_then(pdf::color_from_hex)
+            .unwrap_or([0.0, 0.0, 0.0]),
+        fill: sticker_bg.as_deref().and_then(pdf::color_from_hex),
     });
     // Encoding pages at 300 dpi takes seconds on a full sheet: keep it off the
     // UI thread, as the import and the nesting already do.
@@ -1266,6 +1321,50 @@ mod tests {
         assert_ne!(importer::hash_bytes(b"uno"), importer::hash_bytes(b"dos"));
         assert_eq!(importer::hash_bytes(b"uno").len(), 64);
     }
+
+    /// Manual maintenance hook, never part of the suite: sweeps a library
+    /// that already lives on disk. `#[ignore]` keeps it out of `cargo test`;
+    /// run it as
+    /// `STICKERS_LIBRARY_ROOT=<carpeta> cargo test --lib sweep_a_library_on_disk -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "escribe en una biblioteca real; se lanza a mano"]
+    fn sweep_a_library_on_disk() {
+        let Ok(root) = std::env::var("STICKERS_LIBRARY_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let mut conn = Connection::open(root.join("library.db")).unwrap();
+        db::init(&conn).unwrap();
+        // The same daily copy the app makes before writing anything.
+        let _ = db::backup(&root, &conn);
+        let files = root.join("files");
+        let thumbs = root.join("thumbs");
+        // Chunks keep the database in step with the files, so stopping halfway
+        // leaves the library consistent, and print the pace while it runs.
+        let mut report = optimize::SweepReport::default();
+        let rows = db::artwork_rows(&conn).unwrap();
+        let total = rows.len();
+        let mut rows = rows.into_iter();
+        loop {
+            let chunk: Vec<_> = rows.by_ref().take(25).collect();
+            if chunk.is_empty() {
+                break;
+            }
+            let made = optimize::sweep(&files, &thumbs, chunk);
+            db::apply_artwork(&mut conn, &made.updates).unwrap();
+            report.checked += made.report.checked;
+            report.converted += made.report.converted;
+            report.compressed += made.report.compressed;
+            report.bytes_before += made.report.bytes_before;
+            report.bytes_after += made.report.bytes_after;
+            report.failures.extend(made.report.failures);
+            println!(
+                "{} de {} · comprimidos {} · {} → {} bytes",
+                report.checked, total, report.compressed, report.bytes_before, report.bytes_after
+            );
+        }
+        println!("{}", serde_json::to_string(&report).unwrap());
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1355,6 +1454,7 @@ pub fn run() {
             delete_stickers,
             library_info,
             recalc_dpi,
+            optimize_library,
             sticker_contour,
             nest_sheet,
             export_sheet_pdf,

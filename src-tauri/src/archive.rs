@@ -11,7 +11,7 @@
 //! the file has been streamed.
 
 use crate::db::{self, RestoredSticker, Sticker};
-use crate::importer;
+use crate::{importer, optimize};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -128,9 +128,18 @@ pub struct Planned {
     pub skipped: usize,
 }
 
+/// What the artwork really is once it has been prepared for storage: an SVG
+/// arrives as a PNG, and a PNG arrives recompressed.
+pub struct StoredArt {
+    pub file_name: String,
+    pub ext: String,
+    pub probe: importer::Probe,
+}
+
 pub struct Outcome {
     pub plan: Plan,
     pub error: Option<String>,
+    pub stored: Option<StoredArt>,
 }
 
 fn now_ms() -> i64 {
@@ -383,22 +392,43 @@ pub fn extract(root: &Path, path: &Path, plans: Vec<Plan>) -> Result<Vec<Outcome
             Err(message) => Outcome {
                 plan,
                 error: Some(message),
+                stored: None,
             },
             Ok(target) => {
-                let thumb = importer::probe(&target, &plan.sticker.ext, &thumbs, &plan.id);
-                // A vector file without width is still usable: its size travels
-                // in the manifest and there is no preview to build.
-                match thumb {
-                    Ok(_) => Outcome { plan, error: None },
-                    Err(message) if plan.sticker.ext.eq_ignore_ascii_case("svg") => {
-                        let _ = message;
-                        Outcome { plan, error: None }
-                    }
+                // The library keeps one raster format: an SVG is baked here,
+                // before the preview is built, so every imported row has one.
+                match optimize::prepare_file(&target, &plan.sticker.ext).and_then(
+                    |(stored, ext)| {
+                        let probe = importer::probe(&stored, &ext, &thumbs, &plan.id)?;
+                        // `prepare_file` already wrote the tight artwork; the
+                        // preview is new and still needs the same treatment.
+                        if ext == "png" && probe.has_alpha {
+                            let _ =
+                                optimize::optimize_file(&thumbs.join(format!("{}.png", plan.id)));
+                        }
+                        let file_name = stored
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        Ok(StoredArt {
+                            file_name,
+                            ext,
+                            probe,
+                        })
+                    },
+                ) {
+                    Ok(stored) => Outcome {
+                        plan,
+                        error: None,
+                        stored: Some(stored),
+                    },
                     Err(message) => {
                         let _ = fs::remove_file(&target);
+                        let _ = fs::remove_file(target.with_extension("png"));
                         Outcome {
                             plan,
                             error: Some(message),
+                            stored: None,
                         }
                     }
                 }
@@ -416,8 +446,35 @@ pub fn store(
     outcome: &Outcome,
 ) -> Result<(), String> {
     let plan = &outcome.plan;
-    let file_name = format!("{}.{}", plan.id, plan.sticker.ext);
+    let ext = outcome
+        .stored
+        .as_ref()
+        .map(|stored| stored.ext.clone())
+        .unwrap_or_else(|| plan.sticker.ext.to_ascii_lowercase());
+    let file_name = outcome
+        .stored
+        .as_ref()
+        .map(|stored| stored.file_name.clone())
+        .unwrap_or_else(|| format!("{}.{}", plan.id, ext));
     let target = root.join("files").join(&file_name);
+    // The manifest's pixel measurements describe the file it was exported
+    // from; the artwork that landed may have been rasterised and recompressed.
+    let (width_px, height_px, dpi, has_alpha, kind) = match &outcome.stored {
+        Some(stored) => (
+            stored.probe.width_px,
+            stored.probe.height_px,
+            stored.probe.dpi,
+            stored.probe.has_alpha,
+            stored.probe.kind.to_string(),
+        ),
+        None => (
+            plan.sticker.width_px,
+            plan.sticker.height_px,
+            plan.sticker.dpi,
+            plan.sticker.has_alpha,
+            plan.sticker.kind.clone(),
+        ),
+    };
     let size_bytes = fs::metadata(&target)
         .map(|meta| meta.len() as i64)
         .unwrap_or(plan.sticker.size_bytes);
@@ -431,14 +488,14 @@ pub fn store(
         id: plan.id.clone(),
         name: plan.sticker.name.trim().to_string(),
         file_name,
-        ext: plan.sticker.ext.clone(),
-        kind: plan.sticker.kind.clone(),
-        width_px: plan.sticker.width_px,
-        height_px: plan.sticker.height_px,
+        ext,
+        kind,
+        width_px,
+        height_px,
         width_mm: plan.sticker.width_mm.clamp(1.0, 2000.0),
         height_mm: plan.sticker.height_mm.clamp(1.0, 2000.0),
-        dpi: plan.sticker.dpi,
-        has_alpha: plan.sticker.has_alpha,
+        dpi,
+        has_alpha,
         size_bytes,
         created_at: if plan.sticker.created_at > 0 {
             plan.sticker.created_at
